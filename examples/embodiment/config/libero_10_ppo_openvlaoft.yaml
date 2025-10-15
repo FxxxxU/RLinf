@@ -1,5 +1,5 @@
 defaults:
-  - env/train: libero_10_ppo
+  - env/train: libero_10
   - env/eval: libero_10
   - override hydra/job_logging: stdout
 
@@ -135,6 +135,7 @@ actor:
     attn_implementation: "flash_attention_2"
     low_cpu_mem_usage: True
     trust_remote_code: True
+    gradient_checkpointing: False
 
   optim:
     lr: 5e-6
@@ -150,6 +151,12 @@ actor:
     use_fast: False
     trust_remote_code: True
     padding_side: "right"
+
+  fsdp:
+    forward_prefetch: False
+    limit_all_gathers: False
+    backward_prefetch: False
+    use_orig_params: False
 
 reward:
   use_reward_model: False

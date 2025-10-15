@@ -13,14 +13,16 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from omegaconf import DictConfig
-from vllm.outputs import CompletionOutput
-from vllm.outputs import RequestOutput as VllmRequestOutput
 
-from rlinf.data.datasets import batch_pad_to_fixed_len
+if TYPE_CHECKING:
+    from vllm.outputs import CompletionOutput
+    from vllm.outputs import RequestOutput as VllmRequestOutput
+
+from rlinf.data.datasets.utils import batch_pad_to_fixed_len
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     split_list,
@@ -57,6 +59,79 @@ class RolloutRequest:
     image_data: Union[List[List[bytes]], List[List[str]]]
     answers: List[str]
     multi_modal_inputs: List[Dict]
+
+    def repeat(self) -> "RolloutRequest":
+        """Repeat each input in the RolloutRequest a specified number of times.
+
+        Args:
+            times (int): The number of times to repeat each input.
+
+        Returns:
+            RolloutRequest: A new RolloutRequest with repeated inputs.
+        """
+        assert self.n > 0, "n must be greater than 0"
+
+        input_ids, answers, image_data, multi_modal_inputs = zip(
+            *[
+                (input_id, answer, image_data, multi_modal_inputs)
+                for input_id, answer, image_data, multi_modal_inputs in zip(
+                    self.input_ids,
+                    self.answers,
+                    self.image_data,
+                    self.multi_modal_inputs,
+                )
+                for _ in range(self.n)
+            ]
+        )
+        return RolloutRequest(
+            n=self.n,
+            input_ids=list(input_ids),
+            answers=list(answers),
+            image_data=list(image_data),
+            multi_modal_inputs=list(multi_modal_inputs),
+        )
+
+    def split(self, num_splits: int) -> List["RolloutRequest"]:
+        """Split the RolloutRequest into multiple smaller requests.
+
+        Args:
+            num_splits (int): The number of splits to create.
+
+        Returns:
+            List[RolloutRequest]: A list of smaller RolloutRequest instances.
+        """
+        assert num_splits > 0, "num_splits must be greater than 0"
+        assert len(self.input_ids) % num_splits == 0, (
+            f"Input IDs length {len(self.input_ids)} is not divisible by num_splits {num_splits}"
+        )
+
+        input_ids_split_list = split_list(self.input_ids, num_splits)
+        answers_split_list = split_list(self.answers, num_splits)
+        image_data_split_list = split_list(self.image_data, num_splits)
+        multi_modal_inputs_split_list = split_list(self.multi_modal_inputs, num_splits)
+
+        splitted_requests = []
+        for (
+            input_ids_batch,
+            answers_batch,
+            image_data_batch,
+            multi_modal_inputs_batch,
+        ) in zip(
+            input_ids_split_list,
+            answers_split_list,
+            image_data_split_list,
+            multi_modal_inputs_split_list,
+        ):
+            request = RolloutRequest(
+                n=self.n,
+                input_ids=input_ids_batch,
+                answers=answers_batch,
+                image_data=image_data_batch,
+                multi_modal_inputs=multi_modal_inputs_batch,
+            )
+            splitted_requests.append(request)
+
+        return splitted_requests
 
     def repeat_and_split(
         self, rollout_batch_size: Optional[int] = None
@@ -279,13 +354,13 @@ class RolloutResult:
     @staticmethod
     def from_vllm_results(
         group_size: int,
-        results: List[VllmRequestOutput],
-        answers: Optional[List[List[int]]] = None,
+        results: List["VllmRequestOutput"],
+        answers: Optional[List[str]] = None,
         multi_modal_inputs: Optional[List[Dict]] = None,
         return_logprobs: bool = False,
     ) -> "RolloutResult":
         def get_logprobs(
-            response_ids: List[int], output: CompletionOutput
+            response_ids: List[int], output: "CompletionOutput"
         ) -> List[float]:
             logprobs = []
             returned_logprobs = output.logprobs
@@ -296,7 +371,14 @@ class RolloutResult:
                 logprobs.append(logprob[response_ids[i]].logprob)
             return logprobs
 
-        num_sequences = len(results)
+        num_sequences = len(results) * group_size
+
+        if multi_modal_inputs:
+            mm_inputs = []
+            for mm_input in multi_modal_inputs:
+                mm_inputs.extend([mm_input] * group_size)
+        else:
+            mm_inputs = None
 
         prompt_lengths = []
         prompt_ids = []
@@ -304,27 +386,43 @@ class RolloutResult:
         response_ids = []
         logprobs = []
         is_end = []
-        for _, res in enumerate(results):
-            if res.prompt_token_ids is not None:
-                prompt_ids.append(res.prompt_token_ids)
-                prompt_lengths.append(len(res.prompt_token_ids))
+        response_texts = []
+        rollout_answers = (
+            [answer for answer in answers for _ in range(group_size)]
+            if answers
+            else None
+        )
+        for vllm_result in results:
+            if vllm_result.prompt_token_ids is not None:
+                prompt_ids.extend([vllm_result.prompt_token_ids] * group_size)
+                prompt_lengths.extend([len(vllm_result.prompt_token_ids)] * group_size)
             else:
-                return NotImplementedError("vllm should return tokenized prompt.")
-            response_id = list(res.outputs[0].token_ids)
-            response_ids.append(response_id)
-            response_lengths.append(len(response_id))
-            is_end.append(res.finished)
+                raise NotImplementedError("vllm should return tokenized prompt.")
+            response_ids.extend(
+                [list(output.token_ids) for output in vllm_result.outputs]
+            )
+            response_texts.extend([output.text for output in vllm_result.outputs])
+            response_lengths.extend(
+                [len(output.token_ids) for output in vllm_result.outputs]
+            )
+            is_end.extend([vllm_result.finished] * group_size)
             if return_logprobs:
-                logprobs.append(get_logprobs(response_id, res.outputs[0]))
+                logprobs.extend(
+                    [
+                        get_logprobs(list(output.token_ids), output)
+                        for output in vllm_result.outputs
+                    ]
+                )
         result: RolloutResult = RolloutResult(
             group_size=group_size,
             num_sequence=num_sequences,
-            answers=answers,
+            answers=rollout_answers,
             prompt_ids=prompt_ids,
             prompt_lengths=prompt_lengths,
             response_ids=response_ids,
             response_lengths=response_lengths,
-            multi_modal_inputs=multi_modal_inputs,
+            response_texts=response_texts,
+            multi_modal_inputs=mm_inputs,
             is_end=is_end,
         )
         if return_logprobs:
@@ -770,14 +868,16 @@ class RolloutResult:
             return merged_batch
         if len(batches) == 1:
             return batches[0]
+
         for key in batches[0].keys():
-            assert torch.is_tensor(batches[0][key]), (
-                f"Expected tensor for key {key} in batches, got {type(batches[0][key])}"
-            )
-            assert torch.is_tensor(batches[0][key]), (
-                f"Expected tensor for key {key} in batches, got {type(batches[0][key])}"
-            )
-            merged_batch[key] = torch.cat([batch[key] for batch in batches], dim=0)
+            if torch.is_tensor(batches[0][key]):
+                merged_batch[key] = torch.cat([batch[key] for batch in batches], dim=0)
+            elif isinstance(batches[0][key], list):
+                merged_batch[key] = []
+                for batch in batches:
+                    merged_batch[key].extend(batch[key])
+            else:
+                raise ValueError(f"Unsupported batch key type: {type(batches[0][key])}")
         return merged_batch
 
 

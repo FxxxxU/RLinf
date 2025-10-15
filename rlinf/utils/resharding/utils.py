@@ -16,15 +16,6 @@
 import torch
 
 
-def get_tpe_reshard_fn(model_arch: str):
-    if model_arch == "qwen3_moe":
-        return tpe_reshard_fn_qwen3_moe
-    else:
-        raise NotImplementedError(
-            f"get_tpe_reshard_fn for model_arch {model_arch} is not implemented"
-        )
-
-
 def get_tp_reshard_fn(model_arch: str):
     if model_arch == "qwen2.5":
         return tp_reshard_fn_qwen2_5
@@ -44,6 +35,15 @@ def get_pp_reshard_fn(model_arch: str):
     else:
         raise NotImplementedError(
             f"get_pp_reshard_fn for model_arch {model_arch} is not implemented"
+        )
+
+
+def get_tpe_reshard_fn(model_arch: str):
+    if model_arch == "qwen3_moe":
+        return tpe_reshard_fn_qwen3_moe
+    else:
+        raise NotImplementedError(
+            f"get_tpe_reshard_fn for model_arch {model_arch} is not implemented"
         )
 
 

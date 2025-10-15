@@ -56,33 +56,28 @@ class ReasoningRunner:
         rollout: Union["SGLangWorker", "VLLMWorker"],
         inference: Optional[MegatronInference],
         actor: MegatronActor,
-        reward: Optional[RewardWorker] = None,
+        reward: RewardWorker,
     ):
         """"""
         self.cfg = cfg
         self.component_placement = placement
         self.is_pipeline = self.component_placement.is_disaggregated
         self.has_dedicated_inference = inference is not None
-        self.has_dedicated_reward = reward is not None
 
         # Workers
         self.rollout = rollout
         self.actor = actor
         # Collocated mode uses actor as inference
         self.inference = inference if self.has_dedicated_inference else self.actor
-        self.reward = reward if self.has_dedicated_reward else self.actor
+        self.reward = reward
 
         # Data channels
         self.dataloader_channel = Channel.create("DataLoader")
         self.rollout_channel = Channel.create("Rollout")
         # Create a local channel (i.e., a channel that is different in every process)
         # if inference is not a dedicated worker
-        self.inference_channel = Channel.create(
-            "Inference", local=not self.has_dedicated_inference
-        )
-        self.reward_channel = Channel.create(
-            "Reward", local=not self.has_dedicated_reward
-        )
+        self.inference_channel = Channel.create("Inference")
+        self.reward_channel = Channel.create("Reward")
         self.actor_channel = Channel.create("Actor", local=True)
 
         # Configurations
@@ -180,8 +175,7 @@ class ReasoningRunner:
         self.actor.init_worker().wait()
         if self.has_dedicated_inference:
             self.inference.init_worker().wait()
-        if self.has_dedicated_reward:
-            self.reward.init_worker().wait()
+        self.reward.init_worker().wait()
 
         if self.cfg.runner.resume_dir is None:
             return
@@ -336,41 +330,39 @@ class ReasoningRunner:
                         output_channel=self.rollout_channel,
                     )
 
+                    # Rewards
+                    reward_handle: Handle = self.reward.compute_rewards(
+                        input_channel=self.rollout_channel,
+                        output_channel=self.reward_channel,
+                    )
+
                     if self.recompute_logprobs:
                         # Inference prev/ref logprobs
                         infer_handle: Handle = self.inference.run_inference(
-                            input_channel=self.rollout_channel,
+                            input_channel=self.reward_channel,
                             output_channel=self.inference_channel,
+                            rollout_channel=self.rollout_channel,
                             compute_ref_logprobs=self.compute_ref_logprobs,
                         )
                         inference_channel = self.inference_channel
                     else:
                         infer_handle = None
-                        inference_channel = self.rollout_channel
-
-                    # Rewards
-                    reward_handle: Handle = self.reward.compute_rewards(
-                        input_channel=inference_channel,
-                        output_channel=self.reward_channel,
-                    )
+                        inference_channel = self.reward_channel
 
                     # Advantages and returns
                     adv_handle: Handle = self.actor.compute_advantages_and_returns(
-                        input_channel=self.reward_channel,
+                        input_channel=inference_channel,
                         output_channel=self.actor_channel,
                     )
 
                     # Actor training
-                    actor_input_channel = self.actor_channel
-                    if self.is_pipeline:
-                        # In pipeline mode, the rollout already contains the advantages and returns
-                        # So the above two steps are in fact no-ops, and we should directly use the inference channel as the input
-                        actor_input_channel = inference_channel
                     actor_handle: Handle = self.actor.run_training(
-                        input_channel=actor_input_channel,
+                        input_channel=self.actor_channel,
                     )
 
                     metrics = actor_handle.wait()
+                    actor_rollout_metrics = metrics[0][0]
+                    actor_training_metrics = metrics[0][1]
                     self.global_steps += 1
 
                     run_time_exceeded = self.run_timer.is_finished()
@@ -416,13 +408,15 @@ class ReasoningRunner:
                 ) * self.cfg.algorithm.n_minibatches
                 # add prefix to the metrics
                 log_time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-                rollout_metrics = {f"rollout/{k}": v for k, v in metrics[0][0].items()}
+                rollout_metrics = {
+                    f"rollout/{k}": v for k, v in actor_rollout_metrics.items()
+                }
 
                 self.metric_logger.log(log_time_metrics, logging_steps)
                 self.metric_logger.log(rollout_metrics, logging_steps)
                 for i in range(self.cfg.algorithm.n_minibatches):
                     training_metrics = {
-                        f"train/{k}": v for k, v in metrics[0][1][i].items()
+                        f"train/{k}": v for k, v in actor_training_metrics[i].items()
                     }
                     self.metric_logger.log(training_metrics, logging_steps + i)
 
@@ -430,14 +424,14 @@ class ReasoningRunner:
 
                 if self.cfg.actor.get("calculate_flops", False):
                     flops_metrics = self._compute_flops_metrics(
-                        time_metrics, metrics[0][0]
+                        time_metrics, actor_rollout_metrics
                     )
                     flops_metrics = {f"flops/{k}": v for k, v in flops_metrics.items()}
                     self.metric_logger.log(flops_metrics, logging_steps)
                     logging_metrics.update(flops_metrics)
 
-                logging_metrics.update(metrics[0][0])
-                logging_metrics.update(metrics[0][1][-1])
+                logging_metrics.update(actor_rollout_metrics)
+                logging_metrics.update(actor_training_metrics[-1])
 
                 global_pbar.set_postfix(logging_metrics)
                 global_pbar.update(1)

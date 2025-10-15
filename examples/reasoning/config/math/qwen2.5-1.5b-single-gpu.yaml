@@ -9,10 +9,10 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,rollout: 0
+    actor,rollout,reward: 0
 
 runner:
-  task_type: math
+  task_type: reasoning
   logger:
     log_path: ${runner.output_dir}/${runner.experiment_name}
     project_name: rlinf
@@ -61,6 +61,8 @@ algorithm:
   entropy_bonus: 0.0
   calculate_entropy: False
   clip_ratio_c: null # 3.0
+  clip_ratio_low: null # if null or not set, will use ratio_clip_eps
+  clip_ratio_high: null # if null or not set, will use ratio_clip_eps
 
   adv_type: math_grpo
   normalize_advantages: True
@@ -90,7 +92,7 @@ rollout:
   detokenize: False            # Whether to detokenize the output. During RL we actually don't need to detokenize it. Can be set to True for debugging.
   padding: null               # will be tokenizer.pad_token_id if null. it is used to filter megatron's padding for rollout engine
   eos: null                   # will be tokenizer.eos_token_id if null.
-  
+
   rollout_backend: sglang     # here choose which backend to rollout,support [sglang, vllm] 
 
   sglang:
@@ -104,6 +106,8 @@ rollout:
     enable_chunked_prefill: True  # enable vllm to use chunked_prefill.
     enable_prefix_caching: True   # enable vllm to use prefix_caching.
     enable_flash_infer_sampler: True # if True, vllm will use flashinfer to do sampling.
+    max_num_batched_tokens: null # the maximum number of tokens to be batched together in vllm. If set to null, vllm will use its default value.
+    torch_profiler_dir: null # if not null, vllm will enable torch profiler and save the result to the specified directory.
 
   return_logprobs: ${not:${algorithm.recompute_logprobs}}
 
@@ -237,7 +241,7 @@ actor:
       process_num: 16 # number of processes to use for checkpointing
       tensor_model_parallel_size: ${actor.model.tensor_model_parallel_size}
       pipeline_model_parallel_size: ${actor.model.pipeline_model_parallel_size}
-      
+
     profiler: # profile megatron when inference and traning
       output_dir: ${runner.output_dir}/${runner.experiment_name}/profiler
       activities: ["cpu", "cuda"]
@@ -256,9 +260,16 @@ actor:
 
 
 reward:
+  group_name: "RewardGroup"
   use_reward_model: false
   reward_type: 'math'
   reward_scale: 5.0
+
+  tokenizer:
+    tokenizer_model: ${actor.tokenizer.tokenizer_model}
+    use_fast: ${actor.tokenizer.use_fast}
+    trust_remote_code: ${actor.tokenizer.trust_remote_code}
+    padding_side: ${actor.tokenizer.padding_side}
 
 critic:
   use_critic_model: false

@@ -25,6 +25,9 @@ from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 from transformers import AutoConfig
 
+from rlinf.scheduler.cluster import Cluster
+from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
+
 if TYPE_CHECKING:
     from megatron.core.model_parallel_config import ModelParallelConfig
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -33,7 +36,8 @@ logging.getLogger().setLevel(logging.INFO)
 
 SUPPORTED_MODEL_ARCHS = ["qwen2.5", "qwen2.5_vl", "openvla", "openvla_oft", "qwen3_moe"]
 SUPPORTED_ROLLOUT_BACKENDS = ["sglang", "vllm"]
-
+SUPPORTED_TASK_TYPE = ["embodied", "reasoning", "coding_online_rl"]
+SUPPORTED_TRAINING_BACKENDS = ["megatron", "fsdp"]
 __all__ = ["build_config"]
 
 
@@ -158,6 +162,8 @@ def validate_rollout_cfg(cfg):
         cfg.enable_chunked_prefill = cfg.get("enable_chunked_prefill", True)
         cfg.enable_prefix_caching = cfg.get("enable_prefix_caching", True)
         cfg.enable_flash_infer_sampler = cfg.get("enable_flash_infer_sampler", True)
+        cfg.max_num_batched_tokens = cfg.get("max_num_batched_tokens", None)
+        cfg.torch_profiler_dir = cfg.get("torch_profiler_dir", None)
         return cfg
 
     with open_dict(cfg):
@@ -180,7 +186,7 @@ def validate_rollout_cfg(cfg):
 
 def validate_model_cfg_by_hf_config(cfg, hf_model_path):
     # validate by hf config
-    hf_config = AutoConfig.from_pretrained(hf_model_path)
+    hf_config = AutoConfig.from_pretrained(hf_model_path, trust_remote_code=True)
 
     if "Qwen2ForCausalLM" in hf_config.architectures:
         qkv_bias = True
@@ -220,6 +226,16 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
         cfg.model.moe_router_topk = getattr(hf_config, "num_experts_per_tok", 2)
         cfg.model.head_dim = getattr(hf_config, "head_dim", cfg.model.hidden_size // cfg.model.num_attention_heads)
 
+    return cfg
+
+
+def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
+    OmegaConf.set_struct(cfg, True)
+    with open_dict(cfg):
+        cfg.fsdp.forward_prefetch = cfg.fsdp.get("forward_prefetch", False)
+        cfg.fsdp.limit_all_gathers = cfg.fsdp.get("limit_all_gathers", False)
+        cfg.fsdp.backward_prefetch = cfg.fsdp.get("backward_prefetch", False)
+        cfg.fsdp.use_orig_params = cfg.fsdp.get("use_orig_params", False)
     return cfg
 
 
@@ -572,13 +588,63 @@ def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
+    assert cfg.rollout.model_arch == "qwen2.5", (
+        f"Model {cfg.rollout.model_arch} is not supported"
+    )
+
+    assert cfg.algorithm.recompute_logprobs != cfg.rollout.return_logprobs, (
+        "Exactly one of `algorithm.recompute_logprobs` or `rollout.return_logprobs` must be True to compute `prev_logprobs`."
+    )
+
+    assert cfg.algorithm.recompute_logprobs, (
+        "Online coding task must use recompute_logprobs"
+    )
+
+    assert cfg.actor.training_backend == "megatron", (
+        "Online coding task must use megatron training backend"
+    )
+
+    cluster = Cluster(num_nodes=cfg.cluster.num_nodes)
+    component_placement = ModelParallelComponentPlacement(cfg, cluster)
+    assert component_placement.placement_mode == PlacementMode.DISAGGREGATED, (
+        "Online coding task must use disaggregated placement mode"
+    )
+
+    with open_dict(cfg):
+        cfg.algorithm.training_batch_size_per_gpu = cfg.algorithm.get(
+            "training_batch_size_per_gpu", 1
+        )
+        cfg.algorithm.n_minibatches = cfg.algorithm.get("n_minibatches", 1)
+        cfg.algorithm.max_num_gen_batches = cfg.algorithm.get("max_num_gen_batches", 1)
+        cfg.actor.micro_batch_size = cfg.algorithm.training_batch_size_per_gpu
+        cfg.actor.global_batch_size = (
+            cfg.data.rollout_batch_size
+            * cfg.algorithm.group_size
+            // cfg.algorithm.n_minibatches
+        )
+        assert cfg.actor.micro_batch_size >= 1
+        assert cfg.actor.global_batch_size >= 1
+        assert cfg.runner.seq_length > cfg.data.max_prompt_length, (
+            f"runner.seq_length ({cfg.runner.seq_length}) must be greater than data.max_prompt_length ({cfg.data.max_prompt_length})"
+        )
+
+        cfg.rollout = validate_rollout_cfg(cfg.rollout)
+    return cfg
+
+
 def validate_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
 
+    assert cfg.runner.task_type in SUPPORTED_TASK_TYPE, (
+        f"task_type must be one of {SUPPORTED_TASK_TYPE}"
+    )
     if cfg.runner.task_type == "embodied":
         cfg = validate_embodied_cfg(cfg)
-    if cfg.runner.task_type == "reasoning":
+    elif cfg.runner.task_type == "reasoning":
         cfg = validate_reasoning_cfg(cfg)
+    elif cfg.runner.task_type == "coding_online_rl":
+        cfg = validate_coding_online_rl_cfg(cfg)
 
     if (
         cfg.algorithm.adv_type == "embodied_grpo"
@@ -586,13 +652,21 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
     ):
         assert cfg.algorithm.group_size > 1
 
+    assert cfg.actor.training_backend in SUPPORTED_TRAINING_BACKENDS, (
+        f"Unsupported training_backend {cfg.actor.training_backend}. Supported training backends are {SUPPORTED_TRAINING_BACKENDS}."
+    )
+
     if cfg.actor.training_backend == "megatron":
         cfg.actor = validate_megatron_cfg(cfg.actor)
         cfg.actor = validate_model_cfg_by_hf_config(cfg.actor, cfg.rollout.model_dir)
+    elif cfg.actor.training_backend == "fsdp":
+        cfg.actor = validate_fsdp_cfg(cfg.actor)
 
     if cfg.critic.use_critic_model and cfg.critic.training_backend == "megatron":
         cfg.critic = validate_megatron_cfg(cfg.critic)
-        cfg = validate_model_cfg_by_hf_config(cfg.critic, cfg.rollout.model_dir)
+        cfg.critic = validate_model_cfg_by_hf_config(cfg.critic, cfg.rollout.model_dir)
+    elif cfg.critic.use_critic_model and cfg.critic.training_backend == "fsdp":
+        cfg.critic = validate_fsdp_cfg(cfg.critic)
 
     return cfg
 

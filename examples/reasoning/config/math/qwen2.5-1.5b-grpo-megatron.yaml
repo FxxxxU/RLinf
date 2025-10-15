@@ -9,10 +9,10 @@ hydra:
 cluster:
   num_nodes: 16
   component_placement:
-    actor,rollout: all
+    actor,rollout,reward: all
 
 runner:
-  task_type: math
+  task_type: reasoning
   logger:
     log_path: ${runner.output_dir}/${runner.experiment_name}
     project_name: rlinf
@@ -61,6 +61,8 @@ algorithm:
   entropy_bonus: 0.0
   calculate_entropy: False
   clip_ratio_c: null # 3.0
+  clip_ratio_low: null # if null or not set, will use ratio_clip_eps
+  clip_ratio_high: null # if null or not set, will use ratio_clip_eps
 
   adv_type: math_grpo
   normalize_advantages: True
@@ -104,6 +106,8 @@ rollout:
     enable_chunked_prefill: True  # enable vllm to use chunked_prefill.
     enable_prefix_caching: True   # enable vllm to use prefix_caching.
     enable_flash_infer_sampler: True # if True, vllm will use flashinfer to do sampling.
+    max_num_batched_tokens: null # the maximum number of tokens to be batched together in vllm. If set to null, vllm will use its default value.
+    torch_profiler_dir: null # if not null, vllm will enable torch profiler and save the result to the specified directory.
 
   return_logprobs: ${not:${algorithm.recompute_logprobs}}
 
@@ -119,6 +123,7 @@ rollout:
 
 data:
   type: math
+  dataset_name: boba
   max_prompt_length: 1024
   filter_prompt_by_length: True
   rollout_batch_size: 512
@@ -256,9 +261,16 @@ actor:
 
 
 reward:
+  group_name: "RewardGroup"
   use_reward_model: false
   reward_type: 'math'
   reward_scale: 5.0
+
+  tokenizer:
+    tokenizer_model: ${actor.tokenizer.tokenizer_model}
+    use_fast: ${actor.tokenizer.use_fast}
+    trust_remote_code: ${actor.tokenizer.trust_remote_code}
+    padding_side: ${actor.tokenizer.padding_side}
 
 critic:
   use_critic_model: false

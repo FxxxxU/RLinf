@@ -17,8 +17,13 @@ import os
 import torch
 import torch.optim as optim
 from omegaconf import DictConfig
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 
 from rlinf.config import torch_dtype_from_precision
@@ -27,6 +32,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
     get_fsdp_wrap_policy,
     init_fn,
 )
+from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import clear_memory
 
 
@@ -37,30 +43,43 @@ class FSDPModelManager:
 
     def __init__(self, cfg: DictConfig):
         self._cfg = cfg
+        self.logger = get_logger()
+        self.torch_dtype = torch_dtype_from_precision(self._cfg.model.precision)
 
-        self.torch_dtype = torch_dtype_from_precision(
-            self._cfg.get("model", {}).get("precision", "bf16")
-        )
+        self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
         self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
     def model_provider_func(self) -> torch.nn.Module:
+        cfg = self._cfg
+        use_gptq = cfg.model.get("gptq_model", False)
+        load_in_8bit = cfg.model.get("load_in_8bit", False)
+
+        use_triton = cfg.get("use_triton", True)
+
+        assert torch.cuda.is_available(), "CUDA is not available."
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+
         model_config = AutoConfig.from_pretrained(
-            self._cfg.model.model_path,
+            cfg.model.model_path,
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
         )
 
-        if self._cfg.model.get("gptq_model", False):
+        if use_gptq:
             from auto_gptq import AutoGPTQForCausalLM
 
             model_wrapper = AutoGPTQForCausalLM.from_quantized(
-                self._cfg.model.model_path, device="cuda:0", use_triton=True
+                cfg.model.model_path,
+                device=device,
+                use_triton=use_triton,
             )
             model = model_wrapper.model
-        elif self._cfg.model.get("load_in_8bit", False):
+        elif load_in_8bit:
             model = AutoModelForCausalLM.from_pretrained(
-                self._cfg.model.model_path,
+                cfg.model.model_path,
+                config=model_config,
                 load_in_8bit=True,
             )
         else:
@@ -69,29 +88,27 @@ class FSDPModelManager:
             else:
                 auto_model_class = AutoModelForCausalLM
 
-            # default load in float16
             model = auto_model_class.from_pretrained(
-                self._cfg.model.model_path,
+                cfg.model.model_path,
                 torch_dtype=self.torch_dtype,
                 config=model_config,
                 trust_remote_code=True,
             )
 
-        model.to(self.torch_dtype)
-
-        if torch.cuda.is_available():
-            model = model.cuda()
-        if self.torch_dtype == torch.float16:
-            model = model.half()
-
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         return model
 
     def setup_model_and_optimizer(self):
         """Setup model and optimizer."""
         module = self.model_provider_func()
 
-        module.gradient_checkpointing_enable()
+        # Enable gradient checkpointing if configured
+        if self._cfg.model.get("gradient_checkpointing", False):
+            self.logger.info("[FSDP] Enabling gradient checkpointing")
+            module.gradient_checkpointing_enable()
+        else:
+            self.logger.info("[FSDP] Gradient checkpointing is disabled")
 
         mixed_precision = MixedPrecision(
             param_dtype=self.torch_dtype,
@@ -119,6 +136,14 @@ class FSDPModelManager:
             sharding_strategy=sharding_strategy,  # zero3
             mixed_precision=mixed_precision,
             sync_module_states=True,
+            forward_prefetch=self._cfg.fsdp.forward_prefetch,
+            backward_prefetch=(
+                BackwardPrefetch.BACKWARD_PRE
+                if self._cfg.fsdp.backward_prefetch
+                else None
+            ),
+            limit_all_gathers=self._cfg.fsdp.limit_all_gathers,
+            use_orig_params=self._cfg.fsdp.use_orig_params,
         )
 
         # NOTE: Currently we assume that only the value head contains "value_head" in its name.
