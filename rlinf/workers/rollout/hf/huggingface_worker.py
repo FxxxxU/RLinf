@@ -175,6 +175,9 @@ class MultiStepRolloutWorker(Worker):
                         self.total_num_train_envs // self.num_pipeline_stages
                     ),
                 }
+            else:
+                self.dst_ranks = {}
+                self.src_ranks = {}
 
         if self.enable_eval:
             self.dst_ranks["eval"] = self._setup_dst_ranks(
