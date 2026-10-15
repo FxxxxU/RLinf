@@ -164,6 +164,10 @@ class MultiStepRolloutWorker(Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
+        prepare_for_inference = getattr(self.hf_model, "prepare_for_inference", None)
+        if callable(prepare_for_inference):
+            prepare_for_inference(self.device)
+
         rlt_feature_model_config = OmegaConf.select(
             self.cfg, "rollout.rlt_feature_model", default=None
         )
@@ -505,6 +509,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
             SupportedModel.MOLMOACT2,
+            SupportedModel.COSMOS3,
         ]:
             if self.enable_dagger:
                 kwargs = {"mode": "eval"}
