@@ -43,6 +43,9 @@ from rlinf.models.embodiment.openpi.dataconfig.franka_co_training_dataconfig imp
 from rlinf.models.embodiment.openpi.dataconfig.franka_dataconfig import (
     CustomDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.geniesim_dual_arm_dataconfig import (
+    LeRobotGenieSimDualArmDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.gsenv_dataconfig import (
     LeRobotGSEnvDataConfig,
 )
@@ -72,6 +75,9 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 )
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
+)
+from rlinf.models.embodiment.openpi.dataconfig.yam_dataconfig import (
+    LeRobotYamDataConfig,
 )
 
 _CONFIGS = [
@@ -127,6 +133,15 @@ _CONFIGS = [
             "checkpoints/jax/pi05_base"
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
+    TrainConfig(
+        name="pi05_geniesim_g2_ah10",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=True
+        ),
+        data=LeRobotGenieSimDualArmDataConfig(
+            base_config=DataConfig(prompt_from_task=True),
+        ),
     ),
     TrainConfig(
         name="pi0_maniskill",
@@ -580,6 +595,18 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="assets/droid"),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
+    ),
+    TrainConfig(
+        name="pi05_yam_joint",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=True
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="yam",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="yam"),
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
     ),
 ]
 

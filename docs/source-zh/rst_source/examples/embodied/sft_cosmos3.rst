@@ -96,7 +96,7 @@ Cosmos3 SFT **从基座模型 Cosmos3-Nano 热启动，训练生成分支与动�
 
 **第 1 步：下载 Cosmos3-Nano（diffusers 格式）**
 
-从 Hugging Face 下载 ``nvidia/Cosmos3-Nano``。它是 **diffusers/safetensors 格式**（``model_index.json`` + ``transformer/*.safetensors`` 分片 + ``vae/`` + ``text_tokenizer/`` 等），**不是 DCP**——SFT 还不能直接用，需第 2 步转成 DCP。
+从 Hugging Face 下载 ``nvidia/Cosmos3-Nano``。它是 **diffusers/safetensors 格式**\ （``model_index.json`` + ``transformer/*.safetensors`` 分片 + ``vae/`` + ``text_tokenizer/`` 等），**不是 DCP**——SFT 还不能直接用，需第 2 步转成 DCP。
 
 .. code-block:: bash
 
@@ -106,15 +106,15 @@ Cosmos3 SFT **从基座模型 Cosmos3-Nano 热启动，训练生成分支与动�
 
 .. note::
 
-   基座用 ``--local-dir`` 下载到**普通目录**即可。
+   基座用 ``--local-dir`` 下载到\ **普通目录**\ 即可。
 
 **第 2 步：转成 DCP**
 
-SFT 不能直接从 diffusers 目录加载基座：cosmos3 的基座加载器 ``_load_base_weights`` 用 ``_is_safetensors_checkpoint`` 判定格式——它只检查路径**顶层**是否有 ``*.safetensors`` 文件（非递归）。diffusers 目录把分片放在 ``transformer/`` 子目录、顶层没有，判定为 ``False``，于是落到 DCP 加载分支，而 diffusers 目录又不是 DCP，会加载失败。因此必须先用 cosmos-framework 的 ``convert_model_to_dcp.py`` 把 diffusers 转成 DCP 再给 ``model_path`` 用。
+SFT 不能直接从 diffusers 目录加载基座：cosmos3 的基座加载器 ``_load_base_weights`` 用 ``_is_safetensors_checkpoint`` 判定格式——它只检查路径\ **顶层**\ 是否有 ``*.safetensors`` 文件（非递归）。diffusers 目录把分片放在 ``transformer/`` 子目录、顶层没有，判定为 ``False``，于是落到 DCP 加载分支，而 diffusers 目录又不是 DCP，会加载失败。因此必须先用 cosmos-framework 的 ``convert_model_to_dcp.py`` 把 diffusers 转成 DCP 再给 ``model_path`` 用。
 
 .. note::
 
-   本步重建整个 OmniMoTModel，会经 cosmos 的 ``hf_cli`` 下载 ``Qwen3-VL-8B-Instruct``（tokenizer）和 ``Wan2.2-TI2V-5B`` 的 ``Wan2.2_VAE.pth``（VAE）——这两个资产离线机器要先下好进 HF 缓存（见上方），再开 ``HF_HUB_OFFLINE=1`` 跑本步。
+   本步重建整个 OmniMoTModel，会经 cosmos 的 ``hf_cli`` 下载 ``Qwen3-VL-8B-Instruct``\ （tokenizer）和 ``Wan2.2-TI2V-5B`` 的 ``Wan2.2_VAE.pth``\ （VAE）——这两个资产离线机器要先下好进 HF 缓存（见上方），再开 ``HF_HUB_OFFLINE=1`` 跑本步。
 
 .. code-block:: bash
 
@@ -130,7 +130,7 @@ SFT 不能直接从 diffusers 目录加载基座：cosmos3 的基座加载器 ``
 .. note::
 
    - ``--checkpoint-path`` 既接受模型名（触发 HF 下载）也接受本地 diffusers 目录；离线机器先下好再指本地路径。
-   - DCP 的 ``.metadata`` 是 pickle、**与保存时的 Python 版本绑定**，所以 ``convert_model_to_dcp`` 必须在与训练**相同的 venv** 里跑，产出的 DCP 才能在训练时加载（目录名带 ``-py311`` 后缀即此意）。
+   - DCP 的 ``.metadata`` 是 pickle、**与保存时的 Python 版本绑定**，所以 ``convert_model_to_dcp`` 必须在与训练\ **相同的 venv** 里跑，产出的 DCP 才能在训练时加载（目录名带 ``-py311`` 后缀即此意）。
 
 Cosmos3-Edge SFT
 ----------------------------------------
@@ -201,9 +201,9 @@ Edge 使用 ``examples/sft/config/libero_sft_cosmos3_edge.yaml``，引入 ``mode
 准备数据
 ----------------------------------------
 
-训练数据用**原始** LeRobot v3 布局（含 ``meta/``、``data/``）的 LIBERO，通过 ``data.train_data_paths`` 指定。
+训练数据用\ **原始** LeRobot v3 布局（含 ``meta/``、``data/``）的 LIBERO，通过 ``data.train_data_paths`` 指定。
 
-``frame_wise_relative`` + ``rot6d`` + ``quantile_rot`` 这套动作转换**不需要预处理数据集**：``rlinf/data/datasets/cosmos3/dataloader.py`` 调 cosmos-framework 的 experiment ``action_policy_libero_all_nano``，加载时在线把原始 7 维动作转成 10 维 rot6d 并做 quantile 归一化。归一化统计文件 ``libero_native_frame_wise_relative_rot6d.json`` 由 cosmos-framework 一次性算好，评测侧用 ``action_stats_path`` 引用。**训练与评测必须用同一套 recipe + 同一个 stats 文件**，否则去归一化错位。
+``frame_wise_relative`` + ``rot6d`` + ``quantile_rot`` 这套动作转换\ **不需要预处理数据集**：``rlinf/data/datasets/cosmos3/dataloader.py`` 调 cosmos-framework 的 experiment ``action_policy_libero_all_nano``，加载时在线把原始 7 维动作转成 10 维 rot6d 并做 quantile 归一化。归一化统计文件 ``libero_native_frame_wise_relative_rot6d.json`` 由 cosmos-framework 一次性算好，评测侧用 ``action_stats_path`` 引用。**训练与评测必须用同一套 recipe + 同一个 stats 文件**，否则去归一化错位。
 
 .. code-block:: yaml
 
@@ -227,7 +227,7 @@ Edge 使用 ``examples/sft/config/libero_sft_cosmos3_edge.yaml``，引入 ``mode
 
 .. warning::
 
-   **初始化必设** ``actor.model.load_to_device: false``。Cosmos3 构建时 ``net``（bf16 ~27GB）+ ``net_ema``（fp32 ~54GB）≈ 81GB，单张 80GB 卡上默认的 eager ``model.to(device)`` 会在 FSDP2 ``fully_shard`` 分片**之前**就 OOM。设为 ``false`` 让模型留在 CPU，由 ``fully_shard`` 直接分片上卡。
+   **初始化必设** ``actor.model.load_to_device: false``。Cosmos3 构建时 ``net``\ （bf16 ~27GB）+ ``net_ema``\ （fp32 ~54GB）≈ 81GB，单张 80GB 卡上默认的 eager ``model.to(device)`` 会在 FSDP2 ``fully_shard`` 分片\ **之前**\ 就 OOM。设为 ``false`` 让模型留在 CPU，由 ``fully_shard`` 直接分片上卡。
 
 断点续训：设 ``runner.resume_dir`` 指向某个 ``global_step_<N>`` 目录后重跑。
 
@@ -353,4 +353,4 @@ Nano 和 Edge 都可以使用 ``--base-model-path``，在 SGLang 环境中用 to
    * - HuggingFace 拉取卡住
      - 离线 + 本地缓存：``HF_HUB_OFFLINE=1``、``TRANSFORMERS_OFFLINE=1``，``HF_HOME`` 指向本地缓存。
    * - 动作乱 / loss 异常
-     - 核对训练与评测两侧 ``action_normalization``（``quantile_rot``）与统计文件同源。
+     - 核对训练与评测两侧 ``action_normalization``\ （``quantile_rot``）与统计文件同源。
