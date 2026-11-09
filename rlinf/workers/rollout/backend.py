@@ -34,7 +34,10 @@ from typing import Literal, Optional
 from omegaconf import DictConfig
 
 from rlinf.scheduler import WorkerAddress
-from rlinf.utils.placement import ModelParallelComponentPlacement
+from rlinf.utils.placement import (
+    HybridComponentPlacement,
+    ModelParallelComponentPlacement,
+)
 from rlinf.workers.rollout.utils import RolloutEngineStats
 
 
@@ -50,7 +53,7 @@ class RlinfContext:
 
     parent_address: WorkerAddress
     weight_reload: Literal["sync", "cpu", None]
-    placement: ModelParallelComponentPlacement
+    placement: ModelParallelComponentPlacement | HybridComponentPlacement
     cfg: DictConfig
     model_instance_id: int
 
@@ -92,7 +95,7 @@ class RolloutBackend(ABC):
         """Generate for a batch of prompts, given as text or as token ids."""
 
     @abstractmethod
-    async def sync_weights(self) -> None:
+    async def sync_weights(self) -> dict | None:
         """Pull the latest weights from the actor side."""
 
     @abstractmethod

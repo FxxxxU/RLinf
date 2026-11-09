@@ -509,7 +509,7 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if _step == start_step or _step % self.weight_sync_interval == 0:
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
@@ -594,7 +594,7 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if _step == start_step or _step % self.weight_sync_interval == 0:
                         self.update_rollout_weights()
                 env_handle: Handle = self.env.interact(
                     input_channel=self.env_channel,
