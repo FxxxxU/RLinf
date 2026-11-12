@@ -327,7 +327,9 @@ class EmbodiedComponentPlacement(HybridComponentPlacement):
         component_names: list[str],
     ) -> FlexiblePlacementStrategy:
         if self.rollout_backend != "sglang" or component_names != ["rollout"]:
-            return super()._gen_resource_placement(rank_map, node_groups, component_names)
+            return super()._gen_resource_placement(
+                rank_map, node_groups, component_names
+            )
 
         resolver = MultiNodeGroupResolver(node_groups)
         width = self.rollout_gpus_per_process

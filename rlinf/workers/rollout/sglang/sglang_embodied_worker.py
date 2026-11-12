@@ -40,6 +40,7 @@ class SGLangEmbodiedWorker(Worker):
     def __init__(
         self,
         config: DictConfig,
+        placement: Optional[EmbodiedComponentPlacement] = None,
         config_rollout: Optional[DictConfig] = None,
     ):
         Worker.__init__(self)
@@ -56,7 +57,11 @@ class SGLangEmbodiedWorker(Worker):
         self._router_client = None
         self.sglang_server_url = None
         self._backend = None
-        self._placement = EmbodiedComponentPlacement(config, Cluster())
+        self._placement = (
+            placement
+            if placement is not None
+            else EmbodiedComponentPlacement(config, Cluster())
+        )
         self.only_eval = config.runner.get("only_eval", False)
         self._weights_ready = False
         self.version = 0
