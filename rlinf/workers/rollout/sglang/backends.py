@@ -20,7 +20,7 @@ sglang HTTP server subprocess.
 """
 
 import asyncio
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import aiohttp
 from sglang.srt.managers.io_struct import (
@@ -33,7 +33,10 @@ from rlinf.workers.rollout.backend import RlinfContext, RolloutBackend
 from rlinf.workers.rollout.sglang.process import SGLangServerProcess
 from rlinf.workers.rollout.utils import RolloutEngineStats
 
-from . import Engine, io_struct
+from . import io_struct
+
+if TYPE_CHECKING:
+    from . import Engine
 
 
 class SGLangEngineBackend(RolloutBackend):
@@ -41,10 +44,10 @@ class SGLangEngineBackend(RolloutBackend):
 
     def __init__(self, server_args: dict, rlinf_ctx: RlinfContext):
         super().__init__(server_args, rlinf_ctx)
-        self._engine: Optional[Engine] = None
+        self._engine: Optional["Engine"] = None
 
     @property
-    def engine(self) -> Engine:
+    def engine(self) -> "Engine":
         """The wrapped sglang Engine (set by `initialize`)."""
         if self._engine is None:
             raise RuntimeError(
@@ -64,6 +67,8 @@ class SGLangEngineBackend(RolloutBackend):
         return self.engine.tokenizer_manager
 
     async def initialize(self) -> None:
+        from . import Engine
+
         self._engine = Engine(**self._server_args)
         await self.engine.tokenizer_manager.run_task_method(
             io_struct.TaskMethodInput(
@@ -126,7 +131,7 @@ class SGLangEngineBackend(RolloutBackend):
 
 
 class SGLangServerBackend(RolloutBackend):
-    """Own an SRT or SGLang Diffusion server and its loopback HTTP client.
+    """Own an SRT or SGLang Diffusion server and its direct HTTP client.
 
     Control requests use shared ``/rlinf/*`` routes; actor weights travel
     directly to scheduler workers. Embodied adapters use ``http_client`` for
@@ -145,6 +150,8 @@ class SGLangServerBackend(RolloutBackend):
         node_rank: int = 0,
         dist_init_addr: Optional[str] = None,
         server_type: str = "srt",
+        bind_host: str = "127.0.0.1",
+        advertise_host: Optional[str] = "127.0.0.1",
     ):
         super().__init__(server_args, rlinf_ctx)
         self._acquire_free_port = acquire_free_port
@@ -154,6 +161,8 @@ class SGLangServerBackend(RolloutBackend):
         self._node_rank = node_rank
         self._dist_init_addr = dist_init_addr
         self._server_type = server_type
+        self._bind_host = bind_host
+        self._advertise_host = advertise_host
         self._process: Optional[SGLangServerProcess] = None
         self._client: Optional[InferenceHTTPClient] = None
 
@@ -168,7 +177,7 @@ class SGLangServerBackend(RolloutBackend):
 
     @property
     def server_url(self) -> str:
-        """The loopback base URL of the server subprocess."""
+        """The advertised base URL of the server subprocess."""
         if self._process is None:
             raise RuntimeError(
                 "SGLangServerBackend.server_url is not available before initialize()"
@@ -200,8 +209,8 @@ class SGLangServerBackend(RolloutBackend):
             nnodes=self._nnodes,
             node_rank=self._node_rank,
             dist_init_addr=self._dist_init_addr,
-            bind_host="127.0.0.1",
-            advertise_host="127.0.0.1",
+            bind_host=self._bind_host,
+            advertise_host=self._advertise_host,
             apply_rlinf_patch=True,
             log_info=self._log_info,
             log_error=self._log_error,
@@ -324,6 +333,9 @@ def make_backend(
     nnodes: int = 1,
     node_rank: int = 0,
     dist_init_addr: Optional[str] = None,
+    server_type: str = "srt",
+    bind_host: str = "127.0.0.1",
+    advertise_host: Optional[str] = "127.0.0.1",
 ) -> RolloutBackend:
     """Select a rollout backend implementation by config value.
 
@@ -344,11 +356,16 @@ def make_backend(
         dist_init_addr: Rendezvous `host:port` on the entry node,
             negotiated via `negotiate_model_instance_dist_addr` (server
             backend only, multi-node).
+        server_type: Native server runtime, ``srt`` or ``embodied``.
+        bind_host: Server listen address.
+        advertise_host: Address advertised to clients; None uses the node IP.
 
     Returns:
         A backend instance (not yet initialized).
     """
     if backend_type == "engine":
+        if server_type != "srt":
+            raise ValueError("Embodied SGLang requires backend_type='server'")
         return SGLangEngineBackend(server_args, rlinf_ctx)
     if backend_type == "server":
         assert acquire_free_port is not None, (
@@ -364,5 +381,8 @@ def make_backend(
             nnodes=nnodes,
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
+            server_type=server_type,
+            bind_host=bind_host,
+            advertise_host=advertise_host,
         )
     raise ValueError(f"Unsupported rollout.sglang.backend_type: {backend_type!r}")
