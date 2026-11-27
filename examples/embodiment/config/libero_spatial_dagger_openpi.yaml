@@ -88,7 +88,7 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  backend: "huggingface"
+  rollout_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10
   enable_offload: False
@@ -96,7 +96,7 @@ rollout:
   collect_prev_infos: False
 
   model:
-    model_path: "/path/to/model"
+    model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
 
   expert_model: # define expert model_path here
@@ -117,6 +117,7 @@ actor:
     num_action_chunks: 10
     add_value_head: False
     openpi:
+      task: dagger
       config_name: "pi0_libero"
       train_expert_only: False
       detach_critic_input: True

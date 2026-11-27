@@ -44,6 +44,7 @@ from torch.optim import Optimizer
 from transformers.trainer_pt_utils import get_module_class_from_name
 
 from rlinf.config import SupportedModel
+from rlinf.data.schema.actor_batch import TokenRows
 from rlinf.hybrid_engines.fsdp import (
     FSDP,
     BackwardPrefetch,
@@ -97,6 +98,23 @@ def create_device_mesh(world_size: int) -> DeviceMesh:
     )
 
 
+def gradient_reduction_group(device_mesh: DeviceMesh) -> torch.distributed.ProcessGroup:
+    """Return the group a gradient's shards are spread over.
+
+    :func:`get_grad_norm` sums per-rank shard norms over this group, so it has
+    to span the sharding dimension and nothing else. Passing ``None`` yields one
+    rank's shard norm instead of the gradient's, and under hybrid sharding the
+    ``ddp`` dimension holds replicas whose norms would be counted once each.
+
+    Args:
+        device_mesh (DeviceMesh): The mesh FSDP was built over.
+
+    Returns:
+        torch.distributed.ProcessGroup: The group behind the ``fsdp`` dimension.
+    """
+    return device_mesh["fsdp"].get_group()
+
+
 def init_fn(x: torch.nn.Module):
     if not torch.distributed.get_rank() == 0:
         x = x.to_empty(device=Worker.torch_platform.current_device(), recurse=False)
@@ -130,19 +148,32 @@ def _normalize_wrap_targets(value):
 
 
 def _resolve_module_classes_to_wrap(module, module_classes_to_wrap):
-    resolved_module_classes = set()
-    for module_class in _normalize_wrap_targets(module_classes_to_wrap) or []:
-        if isinstance(module_class, str):
-            resolved_class = get_module_class_from_name(module, module_class)
-            if resolved_class is None:
-                raise Exception("Could not find the module class to wrap in the model.")
-            resolved_module_classes.add(resolved_class)
-        else:
-            raise TypeError(
-                "module_classes_to_wrap entries must be class name strings; "
-                f"got {type(module_class).__name__!r}"
+    """Resolve short or qualified module class names against the model tree."""
+    classes = {
+        cls
+        for child in module.modules()
+        for cls in type(child).__mro__
+        if issubclass(cls, torch.nn.Module)
+    }
+    resolved = set()
+    for target in _normalize_wrap_targets(module_classes_to_wrap) or []:
+        if not isinstance(target, str):
+            raise TypeError("module_classes_to_wrap entries must be class name strings")
+        matches = {
+            cls
+            for cls in classes
+            if target in (cls.__name__, f"{cls.__module__}.{cls.__qualname__}")
+        }
+        if not matches:
+            raise ValueError(
+                f"Module class selector {target!r} matched no non-root modules"
             )
-    return resolved_module_classes
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous module class {target!r}; use a qualified class name"
+            )
+        resolved.update(matches)
+    return resolved
 
 
 def _fsdp2_fully_shard_supports_ignored_params() -> bool:
@@ -175,6 +206,28 @@ def _collect_ignored_params_for_fsdp2(
         if isinstance(sub, cls_tuple):
             out.update(sub.parameters())
     return out
+
+
+def _module_has_single_floating_dtype(module: torch.nn.Module) -> bool:
+    dtype = None
+    for param in module.parameters():
+        if not param.is_floating_point():
+            continue
+        if dtype is None:
+            dtype = param.dtype
+        elif param.dtype != dtype:
+            return False
+    return dtype is not None
+
+
+def _pi0_fast_dtype_auto_wrap_policy(
+    module: torch.nn.Module, recurse: bool, nonwrapped_numel: int
+) -> bool:
+    if recurse:
+        return True
+    if nonwrapped_numel <= 0:
+        return False
+    return _module_has_single_floating_dtype(module)
 
 
 def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
@@ -238,6 +291,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
 
     # Build policies list
     policies = []
+
+    if (
+        SupportedModel(model_type) == SupportedModel.PI0_FAST
+        and not use_custom_wrap_policy
+    ):
+        # PI0-Fast mixes small FP32 embedding/norm parameters with a BF16 backbone.
+        # FSDP flat parameters must have one dtype, so split only on dtype-uniform modules.
+        policies.append(_pi0_fast_dtype_auto_wrap_policy)
 
     if SupportedModel(model_type) in [
         SupportedModel.CNN_POLICY,
@@ -316,6 +377,17 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
                 _module_wrap_policy, module_classes={MultiQHead}
             )
         policies.append(q_head_policy)
+
+    from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+    policies.append(
+        functools.partial(
+            lambda_auto_wrap_policy,
+            lambda_fn=lambda candidate: (
+                getattr(candidate, "_fsdp_wrap_role", None) is not None
+            ),
+        )
+    )
 
     if module_classes_to_wrap:
         module_classes_to_wrap = _resolve_module_classes_to_wrap(
@@ -463,6 +535,10 @@ def apply_fsdp2_to_model(
     tie_word_embeddings = getattr(
         getattr(module, "config", None), "tie_word_embeddings", False
     )
+    # Models that read embedding weights directly opt out of per-embedding units.
+    wrap_embeddings = not tie_word_embeddings and getattr(
+        module, "_fsdp_wrap_embeddings", True
+    )
 
     modules_to_shard = []
 
@@ -474,7 +550,7 @@ def apply_fsdp2_to_model(
                 no_split_name_set
                 and getattr(submodule, "_fsdp_wrap_name", None) in no_split_name_set
             )
-            or (isinstance(submodule, torch.nn.Embedding) and not tie_word_embeddings)
+            or (isinstance(submodule, torch.nn.Embedding) and wrap_embeddings)
         ):
             modules_to_shard.append((name, submodule, "transformer_or_embedding"))
 
@@ -702,13 +778,12 @@ def clip_grad_by_total_norm_(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     max_grad_norm: Union[int, float],
     total_norm: float,
-    dtype: torch.dtype = torch.float32,
 ):
     """Clips gradient of an iterable of parameters by total norm.
 
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L138
 
-    Note that the gradients are modified in place.
+    Note that the gradients are modified in place, in their original dtype.
 
     Args:
         parameters (Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
@@ -722,9 +797,7 @@ def clip_grad_by_total_norm_(
 
     # Grads.
     grads = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
+        to_local_if_dtensor(p.grad.detach()) for p in parameters if p.grad is not None
     ]
 
     # Scale.
@@ -943,21 +1016,20 @@ def unpack_sequences(
     input_tensor: torch.Tensor,  # [1, max_seq_len]
     idx_starts: list[int],  # [B]
     idx_ends: list[int],  # [B]
-    max_seq_len: int,
+    max_seq_len: Optional[int],
     pad_val,
-):
-    """Restore a packed sequence from pack_sequences back to padded batch format.
-
-    Slices by idx_starts/idx_ends into B segments, places each at [idx_start, idx_end) per row,
-    fills the rest with pad_val. Same 2D layout as before packing for per-sample loss/metrics.
+) -> torch.Tensor | TokenRows:
+    """Restore packed segments as real-length rows or a dense batch.
 
     Args:
         input_tensor: Packed sequence [1, packed_len].
         idx_starts, idx_ends: Start/end (exclusive) in packed sequence per sample (length B).
-        max_seq_len: Sequence length per sample after unpacking. pad_val: Fill for non-valid positions.
+        max_seq_len: Dense output width, or None to return real-length rows.
+        pad_val: Fill for non-valid positions.
 
     Returns:
-        Tensor [B, max_seq_len]; valid content in [idx_start, idx_end), rest pad_val.
+        Real-length rows when max_seq_len is None; otherwise a tensor with
+        valid content in [idx_start, idx_end) and pad_val elsewhere.
     """
     assert len(input_tensor.shape) == 2
     assert input_tensor.shape[0] == 1
@@ -970,6 +1042,9 @@ def unpack_sequences(
         length = idx_end - idx_start
         input_tensors_splits.append(input_tensor[0, cu_len : cu_len + length])
         cu_len += length
+
+    if max_seq_len is None:
+        return input_tensors_splits
 
     # [B, max_seq_len]
     output_tensor = torch.stack(
@@ -1021,8 +1096,8 @@ def prepare_pack_fsdp(
 
 
 def pack_fsdp_input(
-    input_ids,
-    position_ids,
+    input_ids: torch.Tensor | TokenRows,
+    position_ids: torch.Tensor | TokenRows,
     *,
     idx_starts,
     idx_ends,
@@ -1030,19 +1105,26 @@ def pack_fsdp_input(
     eos_token_id,
     pad_to_fixed_len: bool = False,
 ):
-    """Pack FSDP training input_ids and position_ids from [B, seq_len] to [1, max_seq_len_pack].
+    """Pack dense inputs or real-length token rows into one FSDP sequence.
 
     Uses pack_sequences to remove padding; sets attention_mask=None so flash-attn can derive
     cu_seqlens from position_ids.
 
     Args:
-        input_ids, position_ids: [B, seq_len]. idx_starts, idx_ends: From prepare_pack_fsdp.
+        input_ids, position_ids: Dense [B, seq_len] tensors or real-length rows.
+        idx_starts, idx_ends: From prepare_pack_fsdp for dense inputs.
         max_seq_len_pack: Packed length. eos_token_id: Pad value for input_ids end.
         pad_to_fixed_len: Whether to pad to fixed max_seq_len_pack.
 
     Returns:
-        input_ids, position_ids: [1, max_seq_len_pack]. attention_mask: None.
+        Packed input_ids and position_ids [1, packed_len], and attention_mask=None.
     """
+    if isinstance(input_ids, list):
+        return (
+            torch.cat(input_ids).unsqueeze(0),
+            torch.cat(position_ids).unsqueeze(0),
+            None,
+        )
     input_ids = pack_sequences(
         input_ids,
         idx_starts,
@@ -1066,22 +1148,24 @@ def unpack_fsdp_logprobs(
     *,
     idx_starts,
     idx_ends,
-    max_seq_len_unpack,
+    max_seq_len_unpack: Optional[int],
     eos_token_id,
     compute_logprobs_fn,
-):
-    """Compute logprobs from packed model output and unpack to per-sample [B, max_seq_len_unpack].
+) -> torch.Tensor | TokenRows:
+    """Compute packed logprobs and restore their per-sequence token positions.
 
     Builds response targets from input_ids (shift right + eos), calls compute_logprobs_fn(logits, responses),
     then unpack_sequences with idx_starts/idx_ends. Non-valid positions are 0.
 
     Args:
         logits: Model logits in packed format. input_ids: Packed [1, packed_len], for building targets.
-        idx_starts, idx_ends: From prepare_pack_fsdp. max_seq_len_unpack: Seq length per sample after unpack.
+        idx_starts, idx_ends: From prepare_pack_fsdp.
+        max_seq_len_unpack: Dense output width, or None to return real-length rows.
         eos_token_id: Appended when building targets. compute_logprobs_fn: (logits, response_ids) -> logprobs.
 
     Returns:
-        Logprobs [B, max_seq_len_unpack]; valid positions = log prob, rest = 0.
+        Real-length probability rows, or dense [B, max_seq_len_unpack] logprobs
+        with zeros outside the valid segment.
     """
     responses = torch.cat(
         [
@@ -1140,46 +1224,34 @@ def generate_with_kv_cache(
     generated_attention_mask = attention_mask.to(dtype=torch.long)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
 
+    # Qwen-VL models take 3D M-RoPE position ids. Compute them for the prompt
+    # here and advance them by one per decoded token: transformers 5 moved this
+    # bookkeeping out of prepare_inputs_for_generation and into generate().
+    rope_inputs = {
+        k: v
+        for k, v in multi_modal_inputs.items()
+        if k not in ("pixel_values", "pixel_values_videos")
+    }
+    position_ids, _ = model.model.get_rope_index(
+        input_ids, attention_mask=generated_attention_mask, **rope_inputs
+    )
+    next_position = position_ids.amax(dim=(0, 2)) + 1
+
+    model_inputs = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        **multi_modal_inputs,
+    }
     past_key_values = None
 
     for step in range(max_new_tokens):
-        if step == 0:
-            # prefill: full prompt + multimodal
-            cache_position = torch.arange(
-                0,
-                generated_ids.size(1),
-                device=generated_ids.device,
-                dtype=torch.long,
-            )
-            model_inputs = model.prepare_inputs_for_generation(
-                input_ids=generated_ids,
-                attention_mask=generated_attention_mask,
-                use_cache=True,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                **multi_modal_inputs,
-            )
-        else:
-            # decode: only last token + cache
-            new_generated_ids = generated_ids[:, -1:].contiguous()
-            start_pos = generated_attention_mask.size(1) - new_generated_ids.size(1)
-            cache_position = torch.arange(
-                start_pos,
-                generated_attention_mask.size(1),
-                device=generated_ids.device,
-                dtype=torch.long,
-            )
-
-            model_inputs = model.prepare_inputs_for_generation(
-                input_ids=new_generated_ids,
-                attention_mask=generated_attention_mask,
-                use_cache=True,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-            )
-
         with amp_context:
-            outputs = model(**model_inputs)
+            outputs = model(
+                **model_inputs,
+                attention_mask=generated_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
 
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
         past_key_values = (
@@ -1204,6 +1276,12 @@ def generate_with_kv_cache(
         generated_attention_mask = torch.cat(
             [generated_attention_mask, append_mask], dim=-1
         )
+
+        # decode: only the new token; images are already in the KV cache
+        model_inputs = {
+            "input_ids": next_token.unsqueeze(-1),
+            "position_ids": (next_position + step).view(1, -1, 1).expand(3, -1, -1),
+        }
 
         if eos_token_id is not None:
             finished = finished | (next_token == eos_token_id)

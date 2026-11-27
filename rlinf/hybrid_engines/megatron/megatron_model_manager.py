@@ -29,6 +29,7 @@ from omegaconf import DictConfig
 from rlinf.config import build_config, build_transformer_config
 from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.scheduler import Worker
+from rlinf.utils.attention import resolve_attn_implementation
 from rlinf.utils.flops import FLOPSCalculator, ModelConfig
 from rlinf.utils.initialize import initialize_megatron, set_megatron_args
 from rlinf.utils.logging import get_logger
@@ -55,6 +56,7 @@ try:
         get_gpt_layer_with_transformer_engine_spec,
     )
     from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.module import Float16Module as MCoreFloat16Module
 
     HAVE_MEGATRON_CORE = True
@@ -142,11 +144,24 @@ class LinearForLastLayer(torch.nn.Linear):
         *,
         sequence_parallel,
         bias=False,  # TODO changed bias to False for temporary convenience
+        weight_init: str = "normal",
+        init_std: float = 0.02,
     ):
+        """Initialize a critic projection with normal or zero weights."""
+        if weight_init not in ("normal", "zero"):
+            raise ValueError(
+                f"Expected value head initialization to be 'normal' or 'zero', got {weight_init!r}."
+            )
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = sequence_parallel
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
+        if weight_init == "normal":
+            torch.nn.init.normal_(self.weight, mean=0.0, std=init_std)
+        else:
+            torch.nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            torch.nn.init.zeros_(self.bias)
 
     def forward(
         self,
@@ -197,9 +212,6 @@ class MegatronModelManager:
 
         self._cfg = cfg
         self.mbridge = cfg.megatron.get("mbridge", False)
-        # if use the megatron-mbridge need patch some function
-        if self.mbridge:
-            self.patch_mbrdige_function()
 
         self.mcore_gpt = cfg.mcore_gpt
         self.spec_name = cfg.spec_name
@@ -236,18 +248,6 @@ class MegatronModelManager:
 
         # Patch Megatron MoE token dispatcher if FUSCO is available and conditions are met
         self.patch_megatron_moe_dispatcher()
-
-    def patch_mbrdige_function(self):
-        from rlinf.utils.patcher import Patcher
-
-        Patcher.clear()
-        Patcher.add_patch(
-            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils.get_rope_index",
-            "rlinf.hybrid_engines.megatron.utils.get_rope_index",
-        )
-        Patcher.apply()
-
-        self._logger.info("Use the megatron-Mbrdige, patched the fix function Success.")
 
     def patch_megatron_moe_dispatcher(self):
         if HAVE_FUSCO:
@@ -338,7 +338,7 @@ class MegatronModelManager:
         provider.mrope_section = mrope_section
         provider.position_embedding_type = position_embedding_type
         if hasattr(provider, "vision_config"):
-            provider.vision_config._attn_implementation = "flash_attention_2"
+            provider.vision_config._attn_implementation = resolve_attn_implementation()
 
         # the Mbridge run the qwen3-vl-moe model will freeze the language model and vision model by default.
         provider.freeze_language_model = getattr(
@@ -463,6 +463,8 @@ class MegatronModelManager:
                 input_size=self._cfg.model.hidden_size,
                 output_size=1,
                 sequence_parallel=self._cfg.model.sequence_parallel,
+                weight_init=self._cfg.get("value_head_init", "normal"),
+                init_std=self._cfg.model.get("init_method_std", 0.02),
             )
 
         return model
@@ -676,11 +678,26 @@ class MegatronModelManager:
         max_batch_seqlen: int = 4096,
         padding_seqlen: Optional[int] = None,
         keep_left_padding: bool = False,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         **model_forward_kwargs,
     ):
         """Default forward pass for GPT models with optional sequence packing."""
         pre_process = unwrap_model(model).pre_process
+        # Earlier pipeline stages return hidden states for the next stage.
         post_process = unwrap_model(model).post_process
+        if packed_seq_params is not None:
+            output = model(
+                input_ids=input_ids.contiguous(),
+                attention_mask=None,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                **model_forward_kwargs,
+            )
+            if post_process:
+                output /= temperature
+            if post_process and logits_processor is not None:
+                return logits_processor(output, **logits_processor_args)
+            return output
         if pack_seqs:
             batch_size, seq_len = attention_mask.shape[:2]
             input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
@@ -697,7 +714,8 @@ class MegatronModelManager:
                 packed_seq_params=packed_seq_params,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
+            if post_process:
+                output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(
@@ -745,7 +763,8 @@ class MegatronModelManager:
                 position_ids=new_position_ids,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
+            if post_process:
+                output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: tensor_rm_left_padding(v, attention_mask, sequence_parallel)

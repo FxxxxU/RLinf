@@ -96,14 +96,14 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  generation_backend: "huggingface"
+  rollout_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10
   enable_offload: False
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-ManiSkill-25Main-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-ManiSkill-25Main-SFT
+    model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
 actor:
   group_name: "ActorGroup"
@@ -121,6 +121,7 @@ actor:
     num_steps: 4
     # openpi specific parameters
     openpi:
+      task: rl
       value_after_vlm: True
       config_name: "pi05_maniskill"
       num_images_in_input: 1
@@ -143,7 +144,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"   
-    gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
+    gradient_checkpointing: False
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

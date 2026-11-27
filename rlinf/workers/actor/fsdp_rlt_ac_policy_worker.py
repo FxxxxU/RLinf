@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import queue
 
 import torch
@@ -25,7 +26,6 @@ from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import (
     append_to_dict,
     collect_trajectory_replay_metrics,
-    compute_split_num,
     trajectory_has_bool_tensor,
 )
 from rlinf.utils.utils import clear_memory
@@ -83,14 +83,17 @@ class RLTACLossMixin:
         self._require_twin_q(all_q_values)
         return all_q_values[..., 0:1]
 
-    def _discounted_chunk_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+    def _discounted_chunk_rewards(
+        self, rewards: torch.Tensor, gamma: float | torch.Tensor
+    ) -> torch.Tensor:
+        """Discount each chunk's rewards with ``gamma``, a float or ``[B, 1]``."""
         rewards = rewards.reshape(rewards.shape[0], -1)
         rewards = rewards.to(self.torch_dtype)
         chunk_len = rewards.shape[-1]
         discounts = torch.pow(
-            torch.as_tensor(self.cfg.algorithm.gamma, device=rewards.device),
-            torch.arange(chunk_len, device=rewards.device, dtype=rewards.dtype),
-        )
+            torch.as_tensor(gamma, device=rewards.device, dtype=torch.float32),
+            torch.arange(chunk_len, device=rewards.device, dtype=torch.float32),
+        ).to(rewards.dtype)
         return torch.sum(rewards * discounts, dim=-1, keepdim=True)
 
     def _bc_metrics(
@@ -266,9 +269,12 @@ class RLTACLossMixin:
                 )
                 q_next = self._min_twin_q(all_qf_next.detach())
 
-            reward_target = self._discounted_chunk_rewards(rewards)
+            gamma = self._env_values("gamma", batch.get("env_index"), torch.float32)
+            reward_target = self._discounted_chunk_rewards(rewards, gamma)
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
-            bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
+            bootstrap_discount = gamma**reward_horizon
+            if isinstance(bootstrap_discount, torch.Tensor):
+                bootstrap_discount = bootstrap_discount.to(self.torch_dtype)
             if bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
             elif bootstrap_type == "standard":
@@ -494,7 +500,8 @@ class RLTACReplayMixin:
         traj_len = int(trajectory.actions.shape[0])
         bsz = int(trajectory.actions.shape[1])
         num_rows = int(actions.shape[0])
-        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+        env_cfg = self._rollout_geometry.layout.spec(trajectory.env_name).cfg
+        auto_reset = bool(env_cfg.get("auto_reset", False))
 
         for env_idx in range(bsz):
             for t in range(traj_len):
@@ -507,6 +514,7 @@ class RLTACReplayMixin:
                 transition = Trajectory(
                     max_episode_length=1,
                     model_weights_id=trajectory.model_weights_id,
+                    env_name=trajectory.env_name,
                 )
                 for field_name in tensor_fields:
                     value = flat.get(field_name)
@@ -523,15 +531,15 @@ class RLTACReplayMixin:
                 if curr_obs is None:
                     raise ValueError(
                         "RLT transition replay requires curr_obs. Ensure "
-                        "update_rlt_transitions() populated transition obs "
+                        "TrajectoryCollector populated transition observations "
                         f"before replay ingestion, got row index {idx}."
                     )
                 transition.curr_obs = curr_obs
 
                 # Dones have one extra initial slot, so transition t reads
                 # terminal flags from t+1. Rewards are already action-aligned
-                # by EmbodiedTrajectoryBuilder because the initial empty reward is
-                # skipped and the final reward is appended after rollout.
+                # by the trajectory accumulator because the initial empty reward
+                # is skipped and the final reward is appended after rollout.
                 done_idx = min(
                     t + 1,
                     int(trajectory.dones.shape[0]) - 1
@@ -564,7 +572,7 @@ class RLTACReplayMixin:
                 else:
                     raise ValueError(
                         "RLT transition replay requires next_obs for non-terminal "
-                        "transitions. Ensure update_rlt_transitions() populated "
+                        "transitions. Ensure TrajectoryCollector populated "
                         f"transition obs before replay ingestion, got row index {idx}."
                     )
 
@@ -693,9 +701,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
     async def recv_rollout_trajectories(self, input_channel):
         clear_memory(sync=False)
 
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
+        split_num = self._rollout_geometry.shards_per_actor()
 
         recv_list = []
         for _ in range(split_num):
@@ -715,9 +721,10 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             },
             op=torch.distributed.ReduceOp.SUM,
         )
+        replay_size = self.replay_buffer.min_env_samples
         minimums = all_reduce_dict(
             {
-                "min_replay_size": float(self.replay_buffer.total_samples),
+                "min_replay_size": float(replay_size),
                 "min_demo_size": float(
                     0 if self.demo_buffer is None else self.demo_buffer.total_samples
                 ),
@@ -734,7 +741,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             schedule_cfg.get("warmup_min_size", replay_cfg.get("min_buffer_size", 1))
         )
         counters = self._global_rlt_counters()
-        buffer_ready = counters["min_replay_size"] >= min_buffer_size
+        buffer_ready = counters["min_replay_size"] >= max(min_buffer_size, 1)
         warmup_required_updates = int(
             schedule_cfg.get("warmup_post_collect_updates", 0)
         )
@@ -862,7 +869,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         actor_updates_run = 0
         for _ in range(updates_to_run):
             update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
-            metrics_data = self.update_one_epoch(train_actor=True)
+            metrics_data = self.update_one_epoch(train_actor=update_actor)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
             critic_updates_run += 1
@@ -895,6 +902,27 @@ class AsyncRLTACFSDPPolicy(
         super().__init__(cfg)
         self.rlt_schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
         self.use_rlt_schedule = bool(self.rlt_schedule_cfg.get("enable", False))
+        self.transitions_since_train = 0
+        self.episodes_since_train = 0
+        self.total_transitions_added = 0
+        self.total_episodes_added = 0
+        self._warmup_ready_total_transitions: int | None = None
+        self._warmup_ready_total_episodes: int | None = None
+        self.pending_update_budget = 0
+
+    def setup_sac_components(self):
+        """Initialize replay components and let RLT schedule own readiness."""
+        super().setup_sac_components()
+        if self.use_rlt_schedule:
+            self.buffer_dataset.min_replay_buffer_size = 1
+
+    def _global_rlt_counters(self) -> dict[str, float]:
+        """Reuse the shared sync/async RLT counter reduction contract."""
+        return RLTACFSDPPolicy._global_rlt_counters(self)
+
+    def _rlt_updates_to_run(self) -> tuple[int, dict[str, float]]:
+        """Reuse the shared sync/async RLT update-budget calculation."""
+        return RLTACFSDPPolicy._rlt_updates_to_run(self)
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):
         if getattr(self, "_recv_queue", None) is None:
@@ -916,7 +944,70 @@ class AsyncRLTACFSDPPolicy(
         self._update_rollout_ingest_counters(added, completed)
 
     async def run_training(self):
-        mean_metric_dict = await super().run_training()
+        if not self.use_rlt_schedule:
+            mean_metric_dict = await super().run_training()
+            replay_metrics = getattr(self, "_last_replay_metrics", {})
+            if replay_metrics:
+                mean_metric_dict = {**mean_metric_dict, **replay_metrics}
+            return mean_metric_dict
+
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+
+        self._drain_received_trajectories(
+            max_trajectories=self.cfg.actor.get("recv_drain_max_trajectories", 1024)
+        )
+        updates_to_run, schedule_metrics = self._rlt_updates_to_run()
+        if updates_to_run <= 0:
+            mean_metric_dict = self.process_train_metrics(schedule_metrics)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            torch.cuda.empty_cache()
+            return mean_metric_dict
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        torch.distributed.barrier()
+        self.model.train()
+        metrics = {}
+        critic_updates_run = 0
+        actor_updates_run = 0
+        for _ in range(updates_to_run):
+            update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
+            await asyncio.sleep(0)
+            metrics_data = self.update_one_epoch(train_actor=update_actor)
+            append_to_dict(metrics, metrics_data)
+            self.update_step += 1
+            critic_updates_run += 1
+            actor_updates_run += int(update_actor)
+
+        schedule_metrics["rlt/critic_updates_run"] = float(critic_updates_run)
+        schedule_metrics["rlt/actor_updates_run"] = float(actor_updates_run)
+        self.pending_update_budget = max(
+            int(self.pending_update_budget) - critic_updates_run,
+            0,
+        )
+        schedule_metrics["rlt/pending_update_budget"] = float(
+            self.pending_update_budget
+        )
+        append_to_dict(metrics, schedule_metrics)
+        mean_metric_dict = self.process_train_metrics(metrics)
+        self.transitions_since_train = 0
+        self.episodes_since_train = 0
+
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
         replay_metrics = getattr(self, "_last_replay_metrics", {})
         if replay_metrics:
             mean_metric_dict = {**mean_metric_dict, **replay_metrics}

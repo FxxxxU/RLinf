@@ -98,14 +98,14 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  generation_backend: "huggingface"
+  rollout_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10 # It's not important for openpi model
   enable_offload: False
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/openpi/pretrained/model"
+    model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
 
 actor:
@@ -124,6 +124,7 @@ actor:
     num_steps: 4
     # openpi specific parameters
     openpi:
+      task: rl
       value_after_vlm: True
       config_name: "pi05_franka"
       num_images_in_input: 1

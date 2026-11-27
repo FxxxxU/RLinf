@@ -1,0 +1,227 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import dataclasses
+from typing import Any, Literal, Sequence
+
+import torch
+
+from rlinf.models.embodiment.openpi.env_io import EnvIO
+from rlinf.models.embodiment.openpi.pi0 import Pi0
+from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+from rlinf.models.embodiment.openpi.prefix import OpenPiPrefixMixin
+from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
+
+
+class Pi0Eval(OpenPiPrefixMixin, EnvIO, Pi0):
+    """Inference-only: deterministic Euler sampling, optional RTC guidance."""
+
+    def __init__(
+        self,
+        config: Pi0Config,
+        *,
+        num_steps: int = 10,
+        action_env_dim: int | None = None,
+        action_chunk: int | None = None,
+        config_name: str = "",
+        state_indices: Sequence[int] | None = None,
+        rlt_cfg: OpenPiPytorchRLTConfig | None = None,
+        eval_batch_size: int | None = None,
+        eval_seed: int | None = None,
+        sample_compile: bool = False,
+        rtc_enabled: bool = False,
+        rtc_guidance_mode: str = "approx",
+        rtc_guidance_clip: float = 5.0,
+    ):
+        super().__init__(
+            config,
+            num_steps=num_steps,
+            action_env_dim=action_env_dim,
+            action_chunk=action_chunk,
+            config_name=config_name,
+            state_indices=state_indices,
+            rlt_cfg=rlt_cfg,
+        )
+        if eval_batch_size is not None and eval_batch_size < 1:
+            raise ValueError(f"eval_batch_size must be positive, got {eval_batch_size}")
+        if rtc_enabled and (eval_batch_size is not None or eval_seed is not None):
+            raise ValueError("eval_batch_size/eval_seed require RTC to be disabled")
+        self.eval_batch_size = eval_batch_size
+        self.eval_seed = eval_seed
+        self._eval_rng = None
+        if sample_compile:
+            self.sample_actions = torch.compile(
+                self.sample_actions, mode="max-autotune"
+            )
+        self.rtc_enabled = rtc_enabled
+        self.rtc_guidance_mode = rtc_guidance_mode
+        self.rtc_guidance_clip = rtc_guidance_clip
+
+    @torch.no_grad()
+    def predict_action_batch(
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "eval",
+        compute_values: bool = False,
+        *,
+        noise: torch.Tensor | None = None,
+        rng: torch.Generator | None = None,
+        rtc_context=None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        del compute_values, kwargs
+        if mode != "eval":
+            raise NotImplementedError(
+                f"{type(self).__name__} only supports predict_action_batch(mode='eval'); "
+                "use a training task wrapper (rl / dagger / dsrl) for train rollouts."
+            )
+        observation = self.env_obs_to_observation(env_obs)
+        if rtc_context is not None and self.rtc_enabled:
+            if self.rtc_guidance_mode != "approx":
+                raise NotImplementedError(
+                    f"Unsupported RTC guidance mode: {self.rtc_guidance_mode!r}"
+                )
+            return self._predict_eval_with_rtc(
+                observation, rtc_context=rtc_context, noise=noise, rng=rng
+            )
+        if rng is None and self.eval_seed is not None:
+            if self._eval_rng is None or self._eval_rng.device != self.device:
+                self._eval_rng = torch.Generator(device=self.device).manual_seed(
+                    self.eval_seed
+                )
+            rng = self._eval_rng
+        active_mask = env_obs.get("active_mask")
+        if self.eval_batch_size is None and active_mask is None:
+            return self._predict_eval(observation, noise=noise, rng=rng)
+        return self._predict_active_batches(
+            observation, active_mask, noise=noise, rng=rng
+        )
+
+    def _predict_active_batches(self, observation, active_mask, *, noise, rng):
+        """Preserve environment order while sampling only unfinished episodes."""
+        from torch.utils._pytree import tree_map
+
+        batch = observation.state.shape[0]
+        if active_mask is None:
+            active = torch.arange(batch, device=self.device)
+        else:
+            active_mask = torch.as_tensor(
+                active_mask, device=self.device, dtype=torch.bool
+            )
+            if active_mask.shape != (batch,):
+                raise ValueError(
+                    f"Expected active_mask shape {(batch,)}, got {active_mask.shape}"
+                )
+            active = active_mask.nonzero(as_tuple=True)[0]
+        model_actions = torch.zeros(
+            (batch, self.action_horizon, self.action_dim), device=self.device
+        )
+        size = self.eval_batch_size or batch
+        for indices in active.split(size):
+            if indices.numel() == 0:
+                continue
+            fields = {
+                field.name: tree_map(
+                    lambda x: x[indices] if isinstance(x, torch.Tensor) else x,
+                    getattr(observation, field.name),
+                )
+                for field in dataclasses.fields(observation)
+            }
+            selected = dataclasses.replace(observation, **fields)
+            model_actions[indices] = self.sample_actions(
+                selected,
+                num_steps=self.num_steps,
+                noise=None if noise is None else noise[indices],
+                rng=rng,
+            )
+        actions = self.decode_actions(model_actions, observation.state)
+        if active_mask is not None:
+            actions[~active_mask] = 0
+        return actions, {
+            "prev_logprobs": None,
+            "prev_values": None,
+            "forward_inputs": {
+                "action": actions.reshape(batch, -1).contiguous(),
+                "model_action": model_actions.reshape(batch, -1).contiguous(),
+            },
+            "model_actions": model_actions,
+        }
+
+    def _predict_eval_with_rtc(
+        self,
+        observation,
+        *,
+        rtc_context,
+        noise: torch.Tensor | None,
+        rng: torch.Generator | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+            sample_actions_with_rtc_guidance,
+        )
+
+        model_actions = sample_actions_with_rtc_guidance(
+            self,
+            observation,
+            rtc_context,
+            num_steps=self.num_steps,
+            noise=noise,
+            rng=rng,
+            guidance_clip=self.rtc_guidance_clip,
+        )
+        actions = self.decode_actions(model_actions, observation.state)
+        B = actions.shape[0]
+        return actions, {
+            "prev_logprobs": None,
+            "prev_values": None,
+            "forward_inputs": {
+                "action": actions.reshape(B, -1).contiguous(),
+                "model_action": model_actions.reshape(B, -1).contiguous(),
+            },
+            "model_actions": model_actions,
+        }
+
+    def _sample_actions_from_prefix_cache(
+        self,
+        observation,
+        prefix_mask: torch.Tensor,
+        kv_cache: tuple,
+        *,
+        noise: torch.Tensor | None = None,
+        rng: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        batch_size = observation.state.shape[0]
+        device = observation.state.device
+        if noise is None:
+            noise = torch.randn(
+                batch_size,
+                self.action_horizon,
+                self.action_dim,
+                device=device,
+                generator=rng,
+            )
+
+        x_t = noise
+        dt = -1.0 / self.num_steps
+        t = 1.0
+        while t >= -dt / 2:
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.float32)
+            suffix_out = self.run_suffix(
+                observation, x_t, t_tensor, kv_cache, prefix_mask
+            )
+            v_t = self.velocity_from_suffix(suffix_out)
+            x_t = x_t + dt * v_t
+            t += dt
+        return x_t

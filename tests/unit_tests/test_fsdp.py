@@ -1,0 +1,2171 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for FSDP meshes, wrapping, precision policies, and optimizer dtypes."""
+
+import logging
+import os
+import socket
+from datetime import timedelta
+
+import pytest
+import torch
+import torch.distributed as dist
+from omegaconf import OmegaConf
+from torch import nn
+from torch.distributed.fsdp import (
+    FSDPModule,
+    MixedPrecision,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+)
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+from rlinf.config import validate_fsdp_cfg
+from rlinf.hybrid_engines.fsdp.compat import apply_buffer_dtype_compatibility
+from rlinf.hybrid_engines.fsdp.mixed_precision import (
+    build_mixed_precision,
+    get_mixed_precision_wrap_policy,
+)
+from rlinf.hybrid_engines.fsdp.utils import (
+    apply_fsdp2_to_model,
+    clip_grad_by_total_norm_,
+    create_device_mesh,
+)
+from rlinf.scheduler import Worker
+from rlinf.scheduler.cluster import Cluster
+
+# The timeout a bare init_process_group() installs is backend-specific -- 30
+# minutes for NCCL and Gloo, 3636 seconds for HCCL on Ascend -- so no test here
+# may hardcode it. What every backend has in common is that the value is not the
+# one RLINF_TIMEOUT asked for, and that it is below RLinf's own 180-minute
+# default. CONFIGURED_TIMEOUT is an arbitrary value distinguishable from all of
+# them.
+CONFIGURED_TIMEOUT = timedelta(minutes=97)
+RLINF_DEFAULT_TIMEOUT = timedelta(minutes=180)
+
+
+def free_port() -> str:
+    """Reserve an ephemeral port for the rendezvous.
+
+    A fixed port would collide with anything else on a shared CI runner and turn
+    every test in this file into an unrelated bind error.
+
+    Returns:
+        str: A port that was free a moment ago.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return str(probe.getsockname()[1])
+
+
+@pytest.fixture
+def single_rank_env(monkeypatch):
+    """Give a lone pytest process enough of a rendezvous to build a 1-D mesh.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Fixture used to scope the environment
+            variables and the device type to this test.
+
+    Yields:
+        None: Control returns to the test with the environment in place.
+    """
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", free_port())
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    # Worker.torch_device_type is only populated inside a live Worker; the mesh
+    # itself does not care which device type it is built over.
+    monkeypatch.setattr(Worker, "torch_device_type", "cpu", raising=False)
+    try:
+        yield
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def group_timeout(group: dist.ProcessGroup) -> timedelta:
+    """Read the watchdog timeout a process group was created with.
+
+    Args:
+        group (dist.ProcessGroup): The group to inspect.
+
+    Returns:
+        timedelta: The timeout carried by the group's backend options. This is
+            the same ``_timeout`` attribute ``DeviceMesh`` reads when it forwards
+            a timeout to its sub-groups.
+
+    Raises:
+        AssertionError: If no backend exposes a timeout. This fails rather than
+            skipping, because a skip would leave every assertion in this file
+            green on a platform where the timeout cannot be read at all, which
+            is exactly when they stop covering anything.
+    """
+    for device_type in group._device_types:
+        options = getattr(group._get_backend(device_type), "options", None)
+        timeout = getattr(options, "_timeout", None)
+        if timeout is not None:
+            return timeout
+    raise AssertionError(
+        f"no backend of {group} over {list(group._device_types)} exposes a timeout"
+    )
+
+
+def test_mesh_group_uses_the_configured_timeout(single_rank_env, monkeypatch):
+    """The mesh's process group carries RLINF_TIMEOUT, not the backend default."""
+    monkeypatch.setenv(
+        "RLINF_TIMEOUT", str(int(CONFIGURED_TIMEOUT.total_seconds() // 60))
+    )
+
+    mesh = create_device_mesh(1)
+
+    assert group_timeout(mesh["fsdp"].get_group()) == CONFIGURED_TIMEOUT
+
+
+def test_mesh_group_defaults_above_the_torch_watchdog(single_rank_env, monkeypatch):
+    """With RLINF_TIMEOUT unset the mesh still gets RLinf's 180-minute default."""
+    monkeypatch.delenv("RLINF_TIMEOUT", raising=False)
+
+    mesh = create_device_mesh(1)
+
+    assert group_timeout(mesh["fsdp"].get_group()) == RLINF_DEFAULT_TIMEOUT
+
+
+def test_existing_process_group_is_left_alone(single_rank_env, monkeypatch, caplog):
+    """A default group built by another component keeps its own timeout.
+
+    RLINF_TIMEOUT cannot be applied retroactively, so the only thing left to do
+    is say so — otherwise someone who followed the FAQ raises the variable and
+    still dies on the backend watchdog with no clue why.
+    """
+    monkeypatch.setenv(
+        "RLINF_TIMEOUT", str(int(CONFIGURED_TIMEOUT.total_seconds() // 60))
+    )
+    dist.init_process_group(timeout=timedelta(minutes=11))
+
+    with caplog.at_level(logging.WARNING):
+        mesh = create_device_mesh(1)
+
+    assert group_timeout(mesh["fsdp"].get_group()) == timedelta(minutes=11)
+    assert "RLINF_TIMEOUT" in caplog.text
+
+
+def test_collective_timeout_matches_the_scheduler_default(monkeypatch):
+    """``RLINF_TIMEOUT`` is read with the default the scheduler ships."""
+    monkeypatch.delenv("RLINF_TIMEOUT", raising=False)
+    assert Cluster.get_collective_timeout() == timedelta(minutes=180)
+
+    monkeypatch.setenv("RLINF_TIMEOUT", "5")
+    assert Cluster.get_collective_timeout() == timedelta(minutes=5)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("30m", "integer representing minutes"),
+        ("0", "positive number of minutes"),
+        ("-5", "positive number of minutes"),
+    ],
+)
+def test_collective_timeout_rejects_unusable_values(monkeypatch, value, message):
+    """Bad values fail loudly rather than installing a watchdog nobody wants.
+
+    ``0`` and negatives parse as integers but abort the very first collective,
+    so they have to be rejected alongside outright malformed input.
+    """
+    monkeypatch.setenv("RLINF_TIMEOUT", value)
+    with pytest.raises(ValueError, match=message):
+        Cluster.get_collective_timeout()
+
+
+def test_torch_still_installs_the_short_timeout_on_its_own(single_rank_env):
+    """Pin the upstream behaviour that makes ``create_device_mesh`` necessary.
+
+    Letting ``init_device_mesh`` build the group leaves it on the backend's own
+    watchdog, whatever that happens to be, and ``RLINF_TIMEOUT`` is ignored. The
+    assertion is deliberately about what the timeout is *not*: the concrete value
+    differs per backend (1800s on NCCL/Gloo, 3636s on Ascend HCCL), so pinning a
+    number here would fail on some accelerator without anything being wrong.
+
+    If PyTorch ever starts honouring a longer timeout for the implicitly created
+    default group, this test fails and the workaround can be reconsidered.
+    """
+    assert not dist.is_initialized()
+    os.environ["RLINF_TIMEOUT"] = str(int(CONFIGURED_TIMEOUT.total_seconds() // 60))
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+
+        mesh = init_device_mesh("cpu", mesh_shape=(1,), mesh_dim_names=["fsdp"])
+    finally:
+        os.environ.pop("RLINF_TIMEOUT", None)
+
+    group = mesh["fsdp"].get_group()
+    assert group is dist.distributed_c10d._get_default_group()
+    timeout = group_timeout(group)
+    assert timeout != CONFIGURED_TIMEOUT
+    assert timeout < RLINF_DEFAULT_TIMEOUT
+
+
+def test_mesh_dimension_reuses_the_default_group(single_rank_env):
+    """The ``fsdp`` dimension is the default group, which is why the fix works.
+
+    ``DeviceMesh`` only hands a mesh dimension its own sub-group when the
+    dimension is narrower than the world. For the 1-D mesh RLinf builds, the
+    dimension *is* the default group, so setting that group's timeout is enough.
+    """
+    mesh = create_device_mesh(1)
+    assert mesh["fsdp"].get_group() is dist.distributed_c10d._get_default_group()
+
+
+def test_gradients_reduce_over_the_sharding_dimension(single_rank_env):
+    """The norm's process group is the one gradients are sharded over.
+
+    FSDP leaves each rank only its slice of every gradient, so the group has to
+    span the sharding dimension. Reducing over nothing reports one rank's shard
+    norm rather than the gradient's, and gradient clipping then loosens as the
+    job grows; reducing over a replicated dimension counts each shard once per
+    replica. Both are silent, so the lookup fails loudly instead of falling back
+    when no sharding dimension is present.
+    """
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from rlinf.hybrid_engines.fsdp.utils import gradient_reduction_group
+
+    sharded = create_device_mesh(1)
+    assert gradient_reduction_group(sharded) is sharded["fsdp"].get_group()
+
+    hybrid = init_device_mesh("cpu", (1, 1), mesh_dim_names=["ddp", "fsdp"])
+    assert gradient_reduction_group(hybrid) is hybrid["fsdp"].get_group()
+
+    replicated_only = init_device_mesh("cpu", (1,), mesh_dim_names=["ddp"])
+    with pytest.raises(KeyError):
+        gradient_reduction_group(replicated_only)
+
+
+@pytest.mark.parametrize("grad_dtype", [torch.bfloat16, torch.float32])
+def test_clip_grad_scales_gradients_in_place_in_their_own_dtype(grad_dtype):
+    """The clip scales ``p.grad`` itself, not a cast of it.
+
+    Megatron clips fp32 main grads, so its pre-clip cast was free; here grads
+    stay in the mixed-precision reduce dtype, and casting before ``mul_`` would
+    scale a temporary and leave every gradient unclipped.
+    """
+    # Keep the parameter in the grad dtype: torch requires ``p.grad`` to match
+    # ``p.dtype``, and under FSDP2 mixed precision both carry the low dtype.
+    weight = nn.Linear(2, 2, dtype=grad_dtype).weight
+    weight.grad = torch.full((2, 2), 2.0, dtype=grad_dtype)
+
+    clip_grad_by_total_norm_(weight, max_grad_norm=1.0, total_norm=4.0)
+
+    assert weight.grad.dtype is grad_dtype
+    torch.testing.assert_close(weight.grad, torch.full((2, 2), 0.5, dtype=grad_dtype))
+
+
+def test_clip_grad_leaves_gradients_untouched_below_the_max_norm():
+    weight = nn.Linear(2, 2).weight
+    weight.grad = torch.full((2, 2), 2.0)
+
+    clip_grad_by_total_norm_(weight, max_grad_norm=4.0, total_norm=3.0)
+
+    torch.testing.assert_close(weight.grad, torch.full((2, 2), 2.0))
+
+
+def test_clip_grad_scales_dtensor_shards_in_place(single_rank_env):
+    """FSDP2 gradients are DTensors, so scaling the local shard must reach ``p.grad``."""
+    from torch.distributed.tensor import DTensor, Shard
+
+    mesh = create_device_mesh(1)
+    weight = nn.Linear(2, 2, dtype=torch.bfloat16).weight
+    weight.grad = DTensor.from_local(
+        torch.full((2, 2), 2.0, dtype=torch.bfloat16), mesh, [Shard(0)]
+    )
+
+    clip_grad_by_total_norm_(weight, max_grad_norm=1.0, total_norm=4.0)
+
+    torch.testing.assert_close(
+        weight.grad.to_local(), torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+    )
+
+
+class _DomainTable(torch.nn.Module):
+    """Reads its embedding weights directly, like cosmos ``DomainAwareLinear``."""
+
+    def __init__(self):
+        super().__init__()
+        self.table = torch.nn.Embedding(4, 3)
+
+    def forward(self, x):
+        return x @ self.table.weight.T
+
+
+class _Block(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.head = _DomainTable()
+
+    def forward(self, x):
+        return self.head(x)
+
+
+class _Policy(torch.nn.Module):
+    _no_split_modules = ["_Block"]
+
+    def __init__(self):
+        super().__init__()
+        self.block = _Block()
+
+    def forward(self, x):
+        return self.block(x)
+
+
+def _shard(policy: torch.nn.Module) -> torch.nn.Module:
+    return apply_fsdp2_to_model(
+        policy,
+        {},
+        create_device_mesh(1),
+        MixedPrecisionPolicy(),
+        OffloadPolicy(),
+        reshard_after_forward=True,
+    )
+
+
+def test_embeddings_are_sharded_as_their_own_units_by_default(single_rank_env):
+    policy = _shard(_Policy())
+
+    assert isinstance(policy.block.head.table, FSDPModule)
+
+
+def test_a_model_can_keep_its_embeddings_in_the_enclosing_unit(single_rank_env):
+    policy = _Policy()
+    policy._fsdp_wrap_embeddings = False
+    policy = _shard(policy)
+
+    assert not isinstance(policy.block.head.table, FSDPModule)
+
+
+@pytest.mark.parametrize("model_type", ["qwen2.5", "openpi"])
+@pytest.mark.parametrize("root_cast", [True, False])
+@pytest.mark.parametrize("sharding", ["no_shard", "shard_grad_op", "full_shard"])
+def test_strategy_passes_wrapper_overrides_and_root_cast_options(
+    monkeypatch, root_cast, model_type, sharding
+):
+    from rlinf.hybrid_engines.fsdp.strategy import fsdp as strategy_module
+
+    fsdp_cfg = config(
+        mixed_precision={
+            "param_dtype": "bf16",
+            "reduce_dtype": "fp32",
+            "buffer_dtype": "fp32",
+            "cast_root_forward_inputs": root_cast,
+        },
+        wrap_policy={"module_classes_to_wrap": ["Linear"]},
+        sharding_strategy=sharding,
+        use_orig_params=True,
+    )
+    actor = validate_fsdp_cfg(
+        OmegaConf.create(
+            {
+                "fsdp_config": fsdp_cfg,
+                "model": {"model_type": model_type, "is_lora": False},
+            }
+        )
+    )
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(strategy_module, "FSDP", lambda **kwargs: kwargs)
+    compatibility_targets = []
+    monkeypatch.setattr(
+        strategy_module,
+        "apply_buffer_dtype_compatibility",
+        compatibility_targets.append,
+    )
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    kwargs = strategy_module.FSDPStrategy(actor, 1).wrap_model(model, object())
+    assert compatibility_targets == [kwargs]
+    assert kwargs["sharding_strategy"].name.lower() == sharding
+    assert kwargs["mixed_precision"].cast_root_forward_inputs is root_cast
+    assert kwargs["mixed_precision"].cast_forward_inputs
+    plan = kwargs["auto_wrap_policy"]._run_policy(model, set(), kwargs)
+    assert plan[model[0]]["mixed_precision"].param_dtype == torch.bfloat16
+    assert plan[model[1]]["mixed_precision"].param_dtype == torch.float32
+
+
+def config(selector="module_names", targets=None, wrap_mode="individual", **kwargs):
+    return OmegaConf.create(
+        {
+            "mixed_precision_policies": {
+                "sensitive": {
+                    "param_dtype": "fp32",
+                    "reduce_dtype": "fp32",
+                    "buffer_dtype": "fp32",
+                    "cast_forward_inputs": True,
+                }
+            },
+            "wrappers": {
+                "sensitive": {selector: targets or ["1"], "wrap_mode": wrap_mode}
+            },
+            "mixed_precision_rules": {"sensitive": "sensitive"},
+            **kwargs,
+        }
+    )
+
+
+@pytest.mark.parametrize("sharding", ["shard_grad_op", "full_shard"])
+def test_openpi_sharded_training_requires_fsdp1(sharding):
+    actor = OmegaConf.create(
+        {
+            "model": {"model_type": "openpi"},
+            "fsdp_config": {"strategy": "fsdp2", "sharding_strategy": sharding},
+        }
+    )
+    with pytest.raises(AssertionError, match="openpi sharded training requires"):
+        validate_fsdp_cfg(actor)
+
+
+@pytest.mark.parametrize(
+    ("selector", "targets"),
+    [
+        ("module_names", ["1"]),
+        ("module_classes", ["torch.nn.modules.linear.Linear"]),
+        ("wrap_names", ["sensitive"]),
+    ],
+)
+def test_selectors_create_wrapper_overrides(selector, targets):
+    model = nn.Sequential(nn.ReLU(), nn.Linear(2, 2))
+    model[1]._fsdp_wrap_name = "sensitive"
+    default = MixedPrecision(param_dtype=torch.bfloat16)
+    policy = get_mixed_precision_wrap_policy(
+        model, config(selector, targets), None, default
+    )
+    resolved = policy._run_policy(model, set(), {"mixed_precision": default})
+    assert set(resolved) == {model[1]}
+    assert resolved[model[1]]["mixed_precision"].param_dtype == torch.float32
+    assert resolved[model[1]]["mixed_precision"].cast_forward_inputs
+
+
+def test_nested_wrappers_do_not_inherit_parent_override():
+    model = nn.Sequential(nn.Sequential(nn.Linear(2, 2)))
+    default = MixedPrecision(param_dtype=torch.bfloat16)
+
+    def base_policy(module, recurse, nonwrapped_numel):
+        return lambda_auto_wrap_policy(
+            module, recurse, nonwrapped_numel, lambda m: isinstance(m, nn.Linear)
+        )
+
+    policy = get_mixed_precision_wrap_policy(
+        model, config(targets=["0"]), base_policy, default
+    )
+    resolved = policy._run_policy(model, set(), {"mixed_precision": default})
+    assert resolved[model[0]]["mixed_precision"].param_dtype == torch.float32
+    assert resolved[model[0][0]]["mixed_precision"] is default
+
+
+def test_no_rules_preserves_original_policy():
+    sentinel = object()
+    assert (
+        get_mixed_precision_wrap_policy(
+            nn.Linear(2, 2), OmegaConf.create({}), sentinel, MixedPrecision()
+        )
+        is sentinel
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"wrappers": {"sensitive": {"module_names": ["absent"]}}},
+            "matched no",
+        ),
+        (
+            {"mixed_precision_rules": {"sensitive": "typo"}},
+            "unknown policy",
+        ),
+        ({"strategy": "fsdp2"}, "FSDP1"),
+        ({"disable": True}, "disable=true"),
+        ({"amp_autocast": {"enabled": True}}, "amp_autocast"),
+    ],
+)
+def test_invalid_rules_fail_before_wrapping(changes, message):
+    with pytest.raises(ValueError, match=message):
+        get_mixed_precision_wrap_policy(
+            nn.Sequential(nn.ReLU(), nn.Linear(2, 2)),
+            config(**changes),
+            None,
+            MixedPrecision(),
+        )
+
+
+def test_overlapping_rules_are_rejected():
+    cfg = config()
+    cfg.wrappers.overlap = {"module_names": ["*"]}
+    with pytest.raises(ValueError, match="Multiple"):
+        get_mixed_precision_wrap_policy(
+            nn.Sequential(nn.ReLU(), nn.Linear(2, 2)), cfg, None, MixedPrecision()
+        )
+
+
+def test_batchnorm_override_cannot_silently_lose_to_pytorch():
+    with pytest.raises(ValueError, match="BatchNorm"):
+        get_mixed_precision_wrap_policy(
+            nn.Sequential(nn.ReLU(), nn.BatchNorm1d(2)),
+            config(),
+            None,
+            MixedPrecision(),
+        )
+
+
+def test_tied_parameters_cannot_cross_wrapper_boundaries():
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    model[1].weight = model[0].weight
+    with pytest.raises(ValueError, match="Shared parameter"):
+        get_mixed_precision_wrap_policy(model, config(), None, MixedPrecision())
+
+
+def test_explicit_null_keeps_original_dtype_and_torch_defaults():
+    mp = build_mixed_precision(OmegaConf.create({"param_dtype": None}))
+    assert mp.param_dtype is None
+    assert mp.cast_forward_inputs
+
+
+def test_unknown_runtime_options_are_rejected():
+    with pytest.raises(ValueError, match="Unsupported"):
+        build_mixed_precision(OmegaConf.create({"output_dtype": "fp32"}))
+
+
+def test_yaml_validation_rejects_fsdp2_overrides():
+    cfg = config(strategy="fsdp2", mixed_precision={})
+    with pytest.raises(ValueError, match="FSDP1"):
+        validate_fsdp_cfg(OmegaConf.create({"fsdp_config": cfg}))
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"mixed_precision_policies": {"sensitive": {"param_dtype": "fp32"}}},
+            "missing dtype",
+        ),
+        (
+            {"wrappers": {"sensitive": {"module_names": "1"}}},
+            "string list",
+        ),
+        (
+            {
+                "wrappers": {
+                    "sensitive": {"module_names": ["1"], "wrap_names": ["sensitive"]}
+                }
+            },
+            "exactly one",
+        ),
+        (
+            {
+                "mixed_precision_policies": {
+                    "sensitive": {
+                        "param_dtype": "fp32",
+                        "reduce_dtype": "fp32",
+                        "buffer_dtype": "fp32",
+                        "output_dtype": "fp32",
+                    }
+                }
+            },
+            "Unsupported",
+        ),
+    ],
+)
+def test_invalid_policy_schema_fails_during_yaml_validation(changes, message):
+    cfg = config(mixed_precision={}, **changes)
+    with pytest.raises(ValueError, match=message):
+        validate_fsdp_cfg(OmegaConf.create({"fsdp_config": cfg}))
+
+
+@pytest.mark.parametrize("full_precision_eval", [False, True])
+def test_actual_fsdp_wrappers_forward_backward_and_buffers(
+    tmp_path, monkeypatch, full_precision_eval
+):
+    """Exercise native FSDP1 hooks rather than only inspecting policy kwargs."""
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    if dist.is_initialized():
+        pytest.skip("Test requires its own single-rank process group")
+    monkeypatch.setenv("FSDP_USE_FULL_PREC_IN_EVAL", str(int(full_precision_eval)))
+    device = (
+        torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    )
+
+    class LinearWithBuffer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 2)
+            self.register_buffer("offset", torch.ones(2))
+            self.seen_dtype = None
+
+        def forward(self, x):
+            self.seen_dtype = (x.dtype, self.weight.dtype, self.offset.dtype)
+            return super().forward(x) + self.offset
+
+    class RootWithBuffer(nn.Sequential):
+        def __init__(self):
+            super().__init__(LinearWithBuffer(), LinearWithBuffer())
+            self.register_buffer("offset", torch.ones(2))
+
+        def forward(self, x):
+            return super().forward(x) + self.offset
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    try:
+        default = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        )
+        cfg = config()
+
+        def base(module, recurse, nonwrapped_numel):
+            return recurse or isinstance(module, LinearWithBuffer)
+
+        def wrap_model():
+            model = RootWithBuffer().to(device)
+            policy = get_mixed_precision_wrap_policy(model, cfg, base, default)
+            wrapped = FSDP(
+                model,
+                auto_wrap_policy=policy,
+                mixed_precision=default,
+                device_id=device,
+            )
+            apply_buffer_dtype_compatibility(wrapped)
+            return wrapped
+
+        wrapped = wrap_model()
+        assert wrapped._handle is None
+        inputs = torch.randn(2, 2, device=device)
+        for training in (True, False, True):
+            wrapped.train(training)
+            wrapped.zero_grad(set_to_none=True)
+            wrapped(inputs).sum().backward()
+            dtype = (
+                torch.float32
+                if not training and full_precision_eval
+                else torch.bfloat16
+            )
+            assert wrapped[0].module.seen_dtype == (dtype,) * 3
+            assert wrapped[1].module.seen_dtype == (torch.float32,) * 3
+            assert wrapped.module.offset.dtype == dtype
+            assert all(p.grad.dtype == torch.float32 for p in wrapped.parameters())
+
+        with FSDP.summon_full_params(wrapped):
+            assert wrapped[0].module.weight.dtype == torch.float32
+            assert wrapped[0].module.offset.dtype == torch.bfloat16
+
+        expected = wrapped(inputs).detach()
+        state = wrapped.state_dict()
+        assert state["0.offset"].dtype == torch.float32
+        assert state["1.offset"].dtype == torch.float32
+        assert state["offset"].dtype == torch.float32
+        restored = wrap_model()
+        restored.load_state_dict(state)
+        assert torch.equal(restored(inputs), expected)
+        assert restored[0].module.seen_dtype == (torch.bfloat16,) * 3
+        assert restored[1].module.seen_dtype == (torch.float32,) * 3
+    finally:
+        dist.destroy_process_group()
+
+
+def linear_policy(module, recurse, nonwrapped_numel):
+    return recurse or isinstance(module, nn.Linear)
+
+
+@pytest.mark.parametrize("targets", [["0.0", "0.1"], ["0.*"], ["0"]])
+def test_group_creates_one_boundary_and_suppresses_inner_wrappers(targets):
+    model = nn.Sequential(
+        nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)), nn.Linear(2, 2)
+    )
+    default = MixedPrecision(param_dtype=torch.bfloat16)
+    policy = get_mixed_precision_wrap_policy(
+        model, config(targets=targets, wrap_mode="combined"), linear_policy, default
+    )
+    plan = policy._run_policy(model, set(), {"mixed_precision": default})
+    assert set(plan) == {model[0], model[1]}
+    assert plan[model[0]]["mixed_precision"].param_dtype == torch.float32
+    assert plan[model[1]]["mixed_precision"] is default
+
+
+def test_selector_without_group_keeps_separate_wrappers():
+    model = nn.Sequential(nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)))
+    policy = get_mixed_precision_wrap_policy(
+        model, config(targets=["0.*"]), None, MixedPrecision()
+    )
+    assert set(policy._run_policy(model, set(), {})) == {model[0][0], model[0][1]}
+
+
+@pytest.mark.parametrize(
+    "kind, message",
+    [
+        ("coverage", "unselected states"),
+        ("dtype", "uniform original"),
+        ("grad", "requires_grad"),
+        ("nested", "inner wrappers"),
+        ("root", "model root"),
+    ],
+)
+def test_invalid_groups_fail_before_wrapping(kind, message):
+    model = nn.Sequential(
+        nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2), nn.Linear(2, 2)),
+        nn.Linear(2, 2),
+    )
+    cfg = config(targets=["0.*"], wrap_mode="combined")
+    if kind == "coverage":
+        cfg.wrappers.sensitive.module_names = ["0.0", "0.1"]
+    elif kind == "dtype":
+        model[0][1].bfloat16()
+    elif kind == "grad":
+        model[0][1].requires_grad_(False)
+    elif kind == "nested":
+        cfg.wrappers.inner = {"module_names": ["0.0"]}
+    else:
+        cfg.wrappers.sensitive.module_names = ["0", "1"]
+    with pytest.raises(ValueError, match=message):
+        get_mixed_precision_wrap_policy(model, cfg, linear_policy, MixedPrecision())
+
+
+def test_group_allows_mixed_requires_grad_with_orig_params():
+    model = nn.Sequential(nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)))
+    model[0][0].requires_grad_(False)
+    policy = get_mixed_precision_wrap_policy(
+        model,
+        config(targets=["0.*"], wrap_mode="combined", use_orig_params=True),
+        linear_policy,
+        MixedPrecision(),
+    )
+    assert set(policy._run_policy(model, set(), {})) == {model[0]}
+
+
+def test_unbound_wrapper_uses_default_precision():
+    model = nn.Sequential(nn.Linear(2, 2))
+    default = MixedPrecision(param_dtype=torch.bfloat16)
+    cfg = config(targets=["0"], mixed_precision_rules={})
+    policy = get_mixed_precision_wrap_policy(model, cfg, None, default)
+    assert (
+        policy._run_policy(model, set(), {"mixed_precision": default})[model[0]][
+            "mixed_precision"
+        ]
+        is default
+    )
+
+
+def test_every_selector_must_match():
+    with pytest.raises(ValueError, match="matched no"):
+        get_mixed_precision_wrap_policy(
+            nn.Sequential(nn.Linear(2, 2)),
+            config(targets=["0", "typo.*"]),
+            None,
+            MixedPrecision(),
+        )
+
+
+@pytest.mark.parametrize("wrap_mode", ["combined", "subtree"])
+def test_actual_group_owns_multiple_modules(tmp_path, wrap_mode):
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    if dist.is_initialized():
+        pytest.skip("Requires its own process group")
+    device = (
+        torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    )
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'group-init'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Sequential(
+            nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)),
+            nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)),
+            nn.Linear(2, 2),
+        ).to(device)
+        seen = []
+        for child in list(model[0]) + list(model[1]):
+            child.register_forward_pre_hook(
+                lambda module, args: seen.append((args[0].dtype, module.weight.dtype))
+            )
+        default = MixedPrecision(param_dtype=torch.bfloat16, cast_forward_inputs=True)
+        policy = get_mixed_precision_wrap_policy(
+            model,
+            config(
+                targets=["0.*"] if wrap_mode == "combined" else ["[01]"],
+                wrap_mode=wrap_mode,
+            ),
+            linear_policy,
+            default,
+        )
+        wrapped = FSDP(
+            model, auto_wrap_policy=policy, mixed_precision=default, device_id=device
+        )
+        assert isinstance(wrapped[0], FSDP)
+        assert all(isinstance(child, nn.Linear) for child in wrapped[0].module)
+        assert wrapped[0]._flat_param.numel() == 12
+        if wrap_mode == "subtree":
+            assert isinstance(wrapped[1], FSDP)
+            assert all(isinstance(child, nn.Linear) for child in wrapped[1].module)
+            assert wrapped[1]._flat_param.numel() == 12
+        output = wrapped(torch.randn(2, 2, device=device))
+        output.float().square().sum().backward()
+        second_dtype = torch.float32 if wrap_mode == "subtree" else torch.bfloat16
+        assert (
+            seen
+            == [(torch.float32, torch.float32)] * 2 + [(second_dtype, second_dtype)] * 2
+        )
+        assert output.dtype == torch.bfloat16
+        assert all(p.grad is not None for p in wrapped.parameters())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("container", [nn.ModuleList, nn.ModuleDict])
+def test_group_requires_executable_parent(container):
+    children = [nn.Linear(2, 2), nn.Linear(2, 2)]
+    block = container(
+        children if container is nn.ModuleList else dict(zip(["a", "b"], children))
+    )
+    model = nn.Sequential(block)
+    with pytest.raises(ValueError, match="forward execution boundary"):
+        get_mixed_precision_wrap_policy(
+            model, config(targets=["0.*"], wrap_mode="combined"), None, MixedPrecision()
+        )
+
+
+def test_unknown_wrapper_binding_fails_validation():
+    with pytest.raises(ValueError, match="Unknown wrapper"):
+        validate_fsdp_cfg(
+            OmegaConf.create(
+                {
+                    "fsdp_config": config(
+                        mixed_precision={}, mixed_precision_rules={"typo": "sensitive"}
+                    )
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize("select_parent", [False, True])
+def test_pruned_policy_cannot_hide_explicit_child_wrapper(select_parent):
+    model = nn.Sequential(nn.Sequential(nn.Linear(2, 2)))
+    cfg = config(targets=["0.0"])
+    if select_parent:
+        cfg.wrappers.parent = {"module_names": ["0"]}
+
+    def base(module, recurse, nonwrapped_numel):
+        return module is model
+
+    with pytest.raises(ValueError, match="non-recursing policy"):
+        get_mixed_precision_wrap_policy(model, cfg, base, MixedPrecision())
+
+
+@pytest.mark.parametrize(
+    "field", ["wrappers", "mixed_precision_policies", "mixed_precision_rules"]
+)
+def test_empty_invalid_config_mapping_is_rejected(field):
+    cfg = config(mixed_precision={}, **{field: []})
+    with pytest.raises(ValueError, match="must be a mapping"):
+        validate_fsdp_cfg(OmegaConf.create({"fsdp_config": cfg}))
+
+
+@pytest.mark.parametrize("wrap_mode", ["individual", "subtree"])
+@pytest.mark.parametrize("wrap_child", [False, True])
+def test_wrapper_dtype_validation_excludes_separately_wrapped_children(
+    wrap_child, wrap_mode
+):
+    class MixedDtypeModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.offset = nn.Parameter(torch.ones(2))
+            self.child = nn.Linear(2, 2).bfloat16()
+
+        def forward(self, x):
+            return self.child(x) + self.offset
+
+    model = nn.Sequential(MixedDtypeModule())
+    cfg = config(targets=["0"], wrap_mode=wrap_mode)
+    base = linear_policy if wrap_child else None
+    if not wrap_child or wrap_mode == "subtree":
+        with pytest.raises(ValueError, match="uniform original parameter dtype"):
+            get_mixed_precision_wrap_policy(model, cfg, base, MixedPrecision())
+    else:
+        policy = get_mixed_precision_wrap_policy(model, cfg, base, MixedPrecision())
+        plan = policy._run_policy(model, set(), {})
+        assert set(plan) == {model[0], model[0].child}
+
+
+@pytest.mark.parametrize(
+    "selector, targets",
+    [
+        ("module_names", ["[01]"]),
+        ("module_classes", ["torch.nn.modules.container.Sequential"]),
+        ("wrap_names", ["mlp"]),
+    ],
+)
+def test_subtree_creates_one_complete_wrapper_per_match(selector, targets):
+    model = nn.Sequential(
+        nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)),
+        nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)),
+        nn.Linear(2, 2),
+    )
+    model[0]._fsdp_wrap_name = model[1]._fsdp_wrap_name = "mlp"
+    default = MixedPrecision(param_dtype=torch.bfloat16)
+    cfg = config(selector, targets, wrap_mode="subtree")
+    policy = get_mixed_precision_wrap_policy(model, cfg, linear_policy, default)
+    plan = policy._run_policy(model, set(), {"mixed_precision": default})
+    assert set(plan) == {model[0], model[1], model[2]}
+    assert plan[model[0]]["mixed_precision"].param_dtype == torch.float32
+    assert plan[model[1]]["mixed_precision"].param_dtype == torch.float32
+    assert plan[model[2]]["mixed_precision"] is default
+
+
+@pytest.mark.parametrize("mode", [True, False, None, "each"])
+def test_invalid_wrap_modes_fail_config_validation(mode):
+    with pytest.raises(ValueError, match="wrap_mode must be"):
+        validate_fsdp_cfg(
+            OmegaConf.create(
+                {"fsdp_config": config(wrap_mode=mode, mixed_precision={})}
+            )
+        )
+
+
+def test_old_group_option_is_rejected():
+    cfg = config(mixed_precision={})
+    cfg.wrappers.sensitive.group = True
+    with pytest.raises(ValueError, match="unsupported options.*group"):
+        validate_fsdp_cfg(OmegaConf.create({"fsdp_config": cfg}))
+
+
+def test_subtree_cannot_select_nested_boundaries():
+    model = nn.Sequential(nn.Sequential(nn.Linear(2, 2)))
+    with pytest.raises(ValueError, match="inner wrappers"):
+        get_mixed_precision_wrap_policy(
+            model,
+            config(targets=["0", "0.0"], wrap_mode="subtree"),
+            linear_policy,
+            MixedPrecision(),
+        )
+
+
+@pytest.mark.parametrize("root_keep,child_keep", [(True, False), (False, True)])
+def test_adamw_rejects_incompatible_root_or_child_policy(
+    tmp_path, root_keep, child_keep
+):
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    from rlinf.hybrid_engines.fsdp.optim import validate_adam_mixed_precision
+
+    if dist.is_initialized():
+        pytest.skip("Test requires its own single-rank process group")
+    device = (
+        torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    )
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)).to(device)
+
+        def policy(keep):
+            return MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16 if keep else torch.float32,
+                keep_low_precision_grads=keep,
+                cast_forward_inputs=True,
+            )
+
+        model[1] = FSDP(
+            model[1],
+            device_id=device,
+            use_orig_params=True,
+            mixed_precision=policy(child_keep),
+        )
+        wrapped = FSDP(
+            model,
+            device_id=device,
+            use_orig_params=True,
+            mixed_precision=policy(root_keep),
+        )
+        with pytest.raises(ValueError, match="actor.optim.use_fp32_master_params"):
+            validate_adam_mixed_precision(wrapped, use_fp32_master_params=False)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_sharded_retained_gradients(rank, init_file):
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import ShardingStrategy
+
+    from rlinf.hybrid_engines.fsdp.optim import validate_adam_mixed_precision
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=f"file://{init_file}", rank=rank, world_size=2
+    )
+    try:
+        model = FSDP(
+            nn.Linear(4, 4).cuda(rank),
+            device_id=rank,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                keep_low_precision_grads=True,
+            ),
+        )
+        with pytest.raises(ValueError, match="prepares torch.bfloat16 gradients"):
+            validate_adam_mixed_precision(model)
+        # Exercise native hooks to verify the dtype this check predicts.
+        model(torch.ones(2, 4, device=rank)).float().sum().backward()
+        assert {p.grad.dtype for p in model.parameters() if p.grad is not None} == {
+            torch.bfloat16
+        }
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
+def test_sharded_retained_gradient_dtype(tmp_path):
+    torch.multiprocessing.spawn(
+        _check_sharded_retained_gradients,
+        args=(str(tmp_path / "init"),),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("embed_precision", [None, "bf16"])
+def test_openpi_factory_separates_parameter_and_activation_dtypes(
+    tmp_path, monkeypatch, embed_precision
+):
+    from rlinf.models import get_model
+    from rlinf.models.embodiment.openpi.modules import gemma, siglip, utils
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+    from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+
+    monkeypatch.setattr(gemma, "PALIGEMMA_VOCAB_SIZE", 32)
+    monkeypatch.setattr(utils, "_torch_compile_enabled", False)
+    monkeypatch.setattr(
+        siglip,
+        "_decode_variant",
+        lambda variant: {
+            "width": 32,
+            "depth": 1,
+            "num_heads": 4,
+            "mlp_dim": 64,
+            "patch_size": (14, 14),
+        },
+    )
+    source = Pi0(
+        Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=2,
+            max_token_len=4,
+        )
+    )
+    torch.save(source.state_dict(), tmp_path / "full_weights.pt")
+    cfg = OmegaConf.create(
+        {
+            "model_type": "openpi",
+            "model_path": str(tmp_path),
+            "precision": "fp32",
+            "is_lora": False,
+            "load_to_device": False,
+            "action_dim": 32,
+            "num_action_chunks": 2,
+            "num_steps": 1,
+            "openpi": {
+                "task": "sft",
+                "torch_compile": False,
+                "model_action_dim": 32,
+                "action_horizon": 2,
+                "paligemma_variant": "dummy",
+                "action_expert_variant": "dummy",
+                "max_token_len": 4,
+            },
+        }
+    )
+    if embed_precision is not None:
+        cfg.openpi.embed_dtype = embed_precision
+
+    model = get_model(cfg)
+
+    expected = torch.bfloat16 if embed_precision == "bf16" else torch.float32
+    assert model.embed_dtype == model.llm.embed_dtype == model.img.dtype_mm == expected
+    assert {param.dtype for param in model.parameters()} == {torch.float32}
+    torch.testing.assert_close(model.img.stem.weight, source.img.stem.weight)
+
+
+def test_openpi_sft_uses_activation_checkpointing(monkeypatch):
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.openpi.modules import gemma, siglip, utils
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+    from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+
+    monkeypatch.setattr(gemma, "PALIGEMMA_VOCAB_SIZE", 32)
+    monkeypatch.setattr(utils, "_torch_compile_enabled", False)
+    monkeypatch.setattr(
+        siglip,
+        "_decode_variant",
+        lambda variant: {
+            "width": 32,
+            "depth": 1,
+            "num_heads": 4,
+            "mlp_dim": 64,
+            "patch_size": (14, 14),
+        },
+    )
+    cfg = Pi0Config(
+        dtype="float32",
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_horizon=2,
+        max_token_len=4,
+    )
+    model = Pi0(cfg).train()
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+    observation = cfg.fake_obs()
+    checkpoint = torch.utils.checkpoint.checkpoint
+    calls = []
+
+    def record_checkpoint(function, *args, **kwargs):
+        calls.append(function)
+        return checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", record_checkpoint)
+    loss = model(forward_type=ForwardType.SFT, data=(observation, cfg.fake_act()))
+    loss.backward()
+
+    assert calls
+    assert model.img.stem.weight.grad is not None
+    assert model.llm.layers[0].attn.q_proj[0].weight.grad is not None
+    assert model.action_out_proj.weight.grad is not None
+
+
+class _MixedBlock(torch.nn.Module):
+    """A frozen bf16 layer and a trainable fp32 layer in one FSDP unit."""
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = torch.nn.Linear(8, 8).to(torch.bfloat16).requires_grad_(False)
+        self.head = torch.nn.Linear(8, 8)
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+
+class _MixedPolicy(torch.nn.Module):
+    _no_split_modules = ["_MixedBlock"]
+
+    def __init__(self):
+        super().__init__()
+        self.block = _MixedBlock()
+
+    def forward(self, x):
+        return self.block(x)
+
+
+def test_fp32_trainable_weights_beside_frozen_bf16_keep_small_updates(
+    single_rank_env,
+):
+    """A step far below bf16 resolution still lands on fp32 trainable shards.
+
+    LingBot-VLA V2 trains its action expert this way next to a frozen bf16
+    backbone; with bf16 storage, AdamW steps this small round back to the old
+    weights.
+    """
+    from packaging.version import Version
+
+    if Version(torch.__version__) < Version("2.8.0"):
+        pytest.skip(
+            "FSDP2 mixed frozen/trainable parameter dtypes require PyTorch >= 2.8"
+        )
+
+    torch.manual_seed(0)
+    policy = _MixedPolicy()
+    before = policy.block.head.weight.detach().clone()
+    policy = apply_fsdp2_to_model(
+        policy,
+        {},
+        create_device_mesh(1),
+        MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+        OffloadPolicy(),
+        reshard_after_forward=True,
+    )
+    optimizer = torch.optim.AdamW(
+        [p for p in policy.parameters() if p.requires_grad], lr=1e-6
+    )
+
+    output = policy(torch.randn(4, 8, dtype=torch.bfloat16))
+    output.float().square().mean().backward()
+    optimizer.step()
+
+    after = policy.block.head.weight.full_tensor()
+    assert output.dtype == torch.bfloat16
+    assert after.dtype == torch.float32
+    assert (after != before).all()
+
+
+def _embodied_actor(mode_cfg, *, mix_envs=True, rank=0, world_size=1, actor_cls=None):
+    """An embodied FSDP actor holding only the state its batch planning reads."""
+    from rlinf.data.schema.embodied_trajectory import RolloutGeometry
+    from rlinf.envs.layout import EnvLayout
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
+
+    cfg = OmegaConf.create(
+        {
+            "actor": {
+                "seed": 3,
+                "global_batch_size": 4 * world_size,
+                "micro_batch_size": 2,
+            },
+            "algorithm": {"loss_type": "actor_critic", "reward_type": "action_level"},
+            "env": {"train": mode_cfg},
+        }
+    )
+    cfg.actor.mix_envs = mix_envs
+    layout = EnvLayout(cfg.env.train, len(mode_cfg.get("envs", {})) or 1, "p")
+    actor = object.__new__(actor_cls or EmbodiedFSDPActor)
+    actor.cfg = cfg
+    actor._rank, actor._world_size = rank, world_size
+    actor._training_round = 0
+    actor._rollout_geometry = RolloutGeometry(
+        layout=layout, stage_num=1, num_action_chunks=1, actor_world_size=world_size
+    )
+    actor._env_algorithm_cfgs = {
+        spec.name: spec.algorithm_cfg(cfg.algorithm) for spec in layout.specs
+    }
+    return actor
+
+
+def _embodied_env(steps, **fields):
+    return {
+        "env_type": "maniskill",
+        "total_num_envs": 2,
+        "rollout_epoch": 1,
+        "max_steps_per_rollout_epoch": steps,
+        "max_episode_steps": steps,
+        "auto_reset": False,
+        "ignore_terminations": False,
+        **fields,
+    }
+
+
+def _embodied_batch(steps, trajectories, marker=0.0, done_at=None):
+    dones = torch.zeros(steps + 1, trajectories, 1, dtype=torch.bool)
+    if done_at is not None:
+        dones[done_at, 0] = True
+    return {
+        "prev_logprobs": torch.randn(steps, trajectories, 1),
+        "advantages": torch.full((steps, trajectories, 1), marker),
+        "rewards": torch.ones(steps, trajectories, 1),
+        "dones": dones,
+    }
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="masked_normalization runs on CUDA"
+)
+@pytest.mark.parametrize("scope", ["env", "all"])
+def test_async_ppo_normalizes_advantages_over_the_configured_scope(scope):
+    from rlinf.workers.actor.async_ppo_fsdp_worker import AsyncPPOEmbodiedFSDPActor
+
+    # Both envs send one observation format, so their rows share a pool.
+    actor = _embodied_actor(
+        OmegaConf.create({"envs": {"a": _embodied_env(2), "b": _embodied_env(2)}}),
+        actor_cls=AsyncPPOEmbodiedFSDPActor,
+    )
+    actor.cfg.algorithm.adv_norm_scope = scope
+    actor.env_batches = {"a": _embodied_batch(2, 2), "b": _embodied_batch(2, 2)}
+    actor.env_batches["a"]["advantages"] = torch.arange(4.0).reshape(2, 2, 1)
+    actor.env_batches["b"]["advantages"] = 10 * torch.arange(1.0, 5.0).reshape(2, 2, 1)
+    actor.rollout_batches = actor._merge_env_batches()
+
+    actor._normalize_advantages_across_ranks()
+
+    [pool] = actor.rollout_batches
+    # The PPO loss takes float32 advantages.
+    assert pool["advantages"].dtype == torch.float32
+    # Rows keep env order until the training batch is shuffled.
+    a, b = pool["advantages"][:4], pool["advantages"][4:]
+    groups = [a, b] if scope == "env" else [torch.cat([a, b])]
+    for values in groups:
+        assert abs(values.mean().item()) < 1e-4
+        assert abs(values.std(unbiased=False).item() - 1) < 1e-4
+    if scope == "all":
+        assert a.mean() < 0 < b.mean()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="masked_normalization runs on CUDA"
+)
+def test_async_ppo_returns_zero_advantages_for_fully_masked_env_group():
+    from rlinf.workers.actor.async_ppo_fsdp_worker import AsyncPPOEmbodiedFSDPActor
+
+    actor = _embodied_actor(
+        OmegaConf.create(
+            {"envs": {"empty": _embodied_env(2), "valid": _embodied_env(2)}}
+        ),
+        actor_cls=AsyncPPOEmbodiedFSDPActor,
+    )
+    actor.cfg.algorithm.adv_norm_scope = "env"
+    actor.env_batches = {
+        "empty": _embodied_batch(2, 2),
+        "valid": _embodied_batch(2, 2),
+    }
+    actor.env_batches["empty"]["loss_mask"] = torch.zeros(2, 2, 1, dtype=torch.bool)
+    actor.env_batches["valid"]["loss_mask"] = torch.ones(2, 2, 1, dtype=torch.bool)
+    actor.env_batches["empty"]["advantages"] = torch.tensor(
+        [[[1.0], [2.0]], [[3.0], [4.0]]]
+    )
+    actor.env_batches["valid"]["advantages"] = torch.tensor(
+        [[[10.0], [20.0]], [[30.0], [40.0]]]
+    )
+    actor.rollout_batches = actor._merge_env_batches()
+
+    actor._normalize_advantages_across_ranks()
+
+    [pool] = actor.rollout_batches
+    empty_adv, valid_adv = pool["advantages"][:4], pool["advantages"][4:]
+    assert torch.isfinite(empty_adv).all()
+    assert torch.allclose(empty_adv, torch.zeros_like(empty_adv))
+    assert abs(valid_adv.mean().item()) < 1e-4
+    assert abs(valid_adv.std(unbiased=False).item() - 1.0) < 1e-4
+
+
+def test_multi_format_global_batch_plan_distributes_uneven_remainders():
+    actor = _embodied_actor(
+        OmegaConf.create({"envs": {"a": _embodied_env(2), "b": _embodied_env(2)}})
+    )
+    actor.cfg.actor.global_batch_size = 4
+    actor.cfg.actor.mix_envs = True
+    actor.rollout_batches = [
+        {"prev_logprobs": torch.zeros(6, 1)},
+        {"prev_logprobs": torch.zeros(10, 1)},
+    ]
+
+    actor._order_training_batch()
+
+    assert len(actor._global_batch_plan) == 4
+    assert all(sum(takes) == 4 for takes in actor._global_batch_plan)
+    assert [sum(col) for col in zip(*actor._global_batch_plan)] == [6, 10]
+
+
+@pytest.mark.parametrize(
+    ("normalize_cfg", "expect_normalized"),
+    [(True, True), (False, False), (None, False)],
+)
+def test_raw_advantages_honor_normalize_advantages_under_env_scope(
+    monkeypatch, normalize_cfg, expect_normalized
+):
+    from rlinf.workers.actor import embodied_fsdp_actor_worker as actor_mod
+
+    metrics_calls = []
+    monkeypatch.setattr(
+        actor_mod,
+        "compute_rollout_metric_stats",
+        lambda batch: metrics_calls.append(batch) or {},
+    )
+    actor = _embodied_actor(OmegaConf.create(_embodied_env(2)))
+    actor.cfg.runner = {"task_type": "embodied"}
+    actor.cfg.actor.model = {"num_action_chunks": 1}
+    actor.cfg.algorithm.adv_type = "raw"
+    actor.cfg.algorithm.reward_type = "chunk_level"
+    actor.cfg.algorithm.group_size = 1
+    actor.cfg.algorithm.adv_norm_scope = "env"
+    if normalize_cfg is not None:
+        actor.cfg.algorithm.normalize_advantages = normalize_cfg
+    actor._env_algorithm_cfgs = {
+        spec.name: spec.algorithm_cfg(actor.cfg.algorithm)
+        for spec in actor._rollout_geometry.layout.specs
+    }
+    batch = _embodied_batch(2, 2)
+    batch["rewards"] = torch.tensor([[[1.0], [3.0]], [[0.0], [0.0]]])
+    batch["loss_mask"] = torch.ones(2, 2, 1, dtype=torch.bool)
+    actor.env_batches = {None: batch}
+    actor._group_success_metrics = {}
+    actor._timer_metrics = {}
+    actor._accelerator_type = None
+
+    actor.compute_advantages_and_returns()
+
+    assert len(metrics_calls) == 1
+    [pool] = actor.rollout_batches
+    advantages = pool["advantages"]
+    if expect_normalized:
+        assert abs(advantages.mean().item()) < 1e-4
+        assert abs(advantages.std().item() - 1.0) < 1e-3
+    else:
+        assert torch.allclose(
+            advantages.reshape(-1), torch.tensor([1.0, 3.0, 1.0, 3.0])
+        )
+
+
+def test_off_policy_targets_discount_each_sample_with_its_envs_gamma():
+    actor = _embodied_actor(
+        OmegaConf.create({"envs": {"a": _embodied_env(2), "b": _embodied_env(2)}})
+    )
+    actor.cfg.algorithm.gamma = 0.99
+    layout = actor._rollout_geometry.layout
+
+    def env_values(env_index):
+        actor._env_algorithm_cfgs = {
+            spec.name: spec.algorithm_cfg(actor.cfg.algorithm) for spec in layout.specs
+        }
+        return actor._env_values("gamma", env_index, torch.float32)
+
+    # Envs that share algorithm.gamma keep the float SAC and RLT used before.
+    assert env_values(torch.tensor([1, 0])) == 0.99
+    actor.cfg.algorithm.envs = {"b": {"gamma": 0.9}}
+    # Index -1 is a demo sample, which takes algorithm.gamma.
+    assert torch.allclose(
+        env_values(torch.tensor([1, 0, -1])), torch.tensor([[0.9], [0.99], [0.99]])
+    )
+
+
+def test_off_policy_bf16_gamma_exponentiates_in_fp32_before_casting():
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACLossMixin
+
+    actor = _embodied_actor(
+        OmegaConf.create({"envs": {"a": _embodied_env(2), "b": _embodied_env(2)}})
+    )
+    actor.cfg.algorithm.gamma = 0.999
+    actor.cfg.algorithm.envs = {"b": {"gamma": 0.99}}
+    actor.torch_dtype = torch.bfloat16
+    actor._env_algorithm_cfgs = {
+        spec.name: spec.algorithm_cfg(actor.cfg.algorithm)
+        for spec in actor._rollout_geometry.layout.specs
+    }
+
+    gamma = actor._env_values("gamma", torch.tensor([0, 1]), torch.float32)
+    assert gamma.dtype == torch.float32
+    discount = (gamma**8).to(torch.bfloat16)
+    expected_a = (torch.tensor(0.999, dtype=torch.float32) ** 8).to(torch.bfloat16)
+    assert discount[0].item() == pytest.approx(expected_a.item())
+    assert discount[0].item() < 1.0
+
+    rlt = object.__new__(RLTACLossMixin)
+    rlt.torch_dtype = torch.bfloat16
+    rewards = torch.ones((2, 8), dtype=torch.bfloat16)
+    discounted = rlt._discounted_chunk_rewards(rewards, gamma)
+    expected_r0 = sum(0.999**k for k in range(8))
+    assert discounted.dtype == torch.bfloat16
+    assert abs(discounted[0].item() - expected_r0) < 0.05
+    assert discounted[0].item() < 8.0
+
+
+def test_multi_env_pooled_rollout_metrics_merge_per_env_stats_without_extra_reduction(
+    tmp_path, monkeypatch
+):
+    from rlinf.utils.metric_utils import (
+        compute_rollout_metric_stats,
+        compute_rollout_metrics,
+    )
+    from rlinf.workers.actor import embodied_fsdp_actor_worker as actor_mod
+
+    monkeypatch.setattr(Worker, "torch_platform", torch.cpu)
+    calls = []
+
+    def _spy(batch):
+        calls.append(batch)
+        return compute_rollout_metric_stats(batch)
+
+    monkeypatch.setattr(actor_mod, "compute_rollout_metric_stats", _spy)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    try:
+        actor = _embodied_actor(
+            OmegaConf.create({"envs": {"a": _embodied_env(2), "b": _embodied_env(2)}})
+        )
+        actor.cfg.runner = {"task_type": "embodied"}
+        actor.cfg.actor.model = {"num_action_chunks": 1}
+        actor.cfg.algorithm.adv_type = "raw"
+        actor.cfg.algorithm.reward_type = "chunk_level"
+        actor.cfg.algorithm.group_size = 1
+        actor.cfg.algorithm.adv_norm_scope = "env"
+        actor.cfg.algorithm.normalize_advantages = False
+        actor._env_algorithm_cfgs = {
+            spec.name: spec.algorithm_cfg(actor.cfg.algorithm)
+            for spec in actor._rollout_geometry.layout.specs
+        }
+        batch_a = _embodied_batch(2, 2)
+        batch_a["rewards"] = torch.tensor([[[1.0], [5.0]], [[3.0], [7.0]]])
+        batch_a["loss_mask"] = torch.tensor([[[True], [False]], [[True], [True]]])
+        batch_b = _embodied_batch(2, 2)
+        batch_b["rewards"] = torch.tensor([[[10.0], [20.0]], [[30.0], [40.0]]])
+        batch_b["loss_mask"] = torch.zeros(2, 2, 1, dtype=torch.bool)
+        actor.env_batches = {"a": batch_a, "b": batch_b}
+        actor._group_success_metrics = {}
+        actor._timer_metrics = {}
+        actor._accelerator_type = None
+
+        metrics = actor.compute_advantages_and_returns()
+
+        assert len(calls) == 2
+        expected_pooled = compute_rollout_metrics(
+            {
+                "rewards": torch.cat(
+                    [batch_a["rewards"].reshape(-1), batch_b["rewards"].reshape(-1)]
+                ),
+                "advantages": torch.cat(
+                    [
+                        batch_a["advantages"].reshape(-1),
+                        batch_b["advantages"].reshape(-1),
+                    ]
+                ),
+                "loss_mask": torch.cat(
+                    [batch_a["loss_mask"].reshape(-1), batch_b["loss_mask"].reshape(-1)]
+                ),
+            }
+        )
+        for key, value in expected_pooled.items():
+            assert metrics[key] == pytest.approx(value), key
+    finally:
+        dist.destroy_process_group()
+
+
+def test_one_env_trains_on_the_same_batch_and_loss_weights_as_before():
+    from rlinf.utils.nested_dict_process import process_nested_dict_for_train
+    from rlinf.utils.utils import compute_trajectory_loss_mask
+
+    actor = _embodied_actor(OmegaConf.create(_embodied_env(4)), rank=1)
+    batch = _embodied_batch(4, 2, done_at=2)
+    batch["loss_mask"], batch["loss_mask_sum"] = compute_trajectory_loss_mask(
+        batch["dones"], "action_level"
+    )
+    expected = dict(batch)
+    expected["loss_mask_ratio"] = batch["loss_mask_sum"] * 1.0 / 4
+    shuffle_id = torch.randperm(8, generator=torch.Generator().manual_seed(3 + 1))
+    expected = process_nested_dict_for_train(expected, shuffle_id)
+
+    actor.env_batches = {None: dict(batch)}
+    actor.rollout_batches = actor._merge_env_batches()
+    actor._order_training_batch()
+
+    [pool] = actor.rollout_batches
+    assert pool.keys() == expected.keys()
+    for key, value in expected.items():
+        assert torch.equal(pool[key], value), key
+    assert actor._global_batch_plan == [[4], [4]]
+
+
+def test_every_trajectory_weighs_the_same_whatever_its_env_horizon():
+    actor = _embodied_actor(
+        OmegaConf.create(
+            {
+                "envs": {
+                    "short": _embodied_env(2, ignore_terminations=True),
+                    "long": _embodied_env(4, ignore_terminations=True),
+                }
+            }
+        )
+    )
+    actor.env_batches = {
+        "short": _embodied_batch(2, 2, marker=1.0),
+        "long": _embodied_batch(4, 2, marker=2.0),
+    }
+
+    [merged] = actor._merge_env_batches()
+
+    weights = 1.0 / merged["loss_mask_ratio"].squeeze(-1)
+    short = weights[merged["advantages"].squeeze(-1) == 1.0]
+    long = weights[merged["advantages"].squeeze(-1) == 2.0]
+    # Each env holds 2 trajectories, so one trajectory's steps sum to half.
+    assert torch.allclose(short.sum() / 2, long.sum() / 2)
+    assert merged["loss_mask"].all()
+
+
+def test_unmixed_global_batches_hold_one_env_in_an_order_all_ranks_share():
+    mode_cfg = OmegaConf.create(
+        {"envs": {"short": _embodied_env(2), "long": _embodied_env(4)}}
+    )
+    env_orders = []
+    for rank in (0, 1):
+        actor = _embodied_actor(mode_cfg, mix_envs=False, rank=rank, world_size=2)
+        actor.env_batches = {
+            "short": _embodied_batch(2, 2, marker=1.0),
+            "long": _embodied_batch(4, 2, marker=2.0),
+        }
+        actor.rollout_batches = actor._merge_env_batches()
+        actor._order_training_batch()
+
+        markers = [
+            torch.cat([batch["advantages"] for batch in micro_batches]).unique()
+            for micro_batches in actor._global_batches()
+        ]
+        assert all(len(marker) == 1 for marker in markers)
+        env_orders.append([marker.item() for marker in markers])
+
+    assert env_orders[0] == env_orders[1]
+    assert sorted(env_orders[0]) == [1.0, 2.0, 2.0]
+
+
+def test_envs_with_different_policy_inputs_train_in_separate_micro_batches():
+    actor = _embodied_actor(
+        OmegaConf.create(
+            {"envs": {"one_view": _embodied_env(2), "two_views": _embodied_env(2)}}
+        )
+    )
+    one_view = _embodied_batch(2, 2, marker=1.0)
+    one_view["forward_inputs"] = {"pixel_values": torch.zeros(2, 2, 1, 8)}
+    two_views = _embodied_batch(2, 2, marker=2.0)
+    two_views["forward_inputs"] = {"pixel_values": torch.zeros(2, 2, 2, 8)}
+    actor.env_batches = {"one_view": one_view, "two_views": two_views}
+
+    actor.rollout_batches = actor._merge_env_batches()
+    actor._order_training_batch()
+    global_batches = list(actor._global_batches())
+
+    assert len(actor.rollout_batches) == 2
+    # 8 samples make 2 global batches of 4, each taking 2 samples of each format.
+    assert actor._global_batch_plan == [[2, 2], [2, 2]]
+    for micro_batches in global_batches:
+        assert sorted(
+            batch["advantages"].unique().item() for batch in micro_batches
+        ) == [
+            1.0,
+            2.0,
+        ]
+        for batch in micro_batches:
+            views = batch["forward_inputs"]["pixel_values"].shape[1]
+            assert views == batch["advantages"].unique().item()
+
+
+@pytest.mark.parametrize("all_inactive", [False, True])
+def test_art_metrics_weight_active_samples_across_microbatches(
+    tmp_path, monkeypatch, all_inactive
+):
+    from rlinf.algorithms.diffusion.art import compute_art_loss
+    from rlinf.utils.metric_utils import append_to_dict
+    from rlinf.workers.actor.fsdp_art_policy_worker import EmbodiedARTFSDPPolicy
+
+    monkeypatch.setattr(Worker, "torch_platform", torch.cpu)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    try:
+        current = torch.tensor(
+            [[-0.25, -0.25], [0.5, 0.5], [0.25, 0.25], [0.5, 0.5]]
+        ).repeat(2, 1)
+        magnitude = (
+            torch.zeros(8)
+            if all_inactive
+            else torch.tensor([1.0, 0.0, 2.0, 0.0, 1.0, 2.0, 0.0, 0.0])
+        )
+        config = OmegaConf.create(
+            {"art_mask_metric": "fixed_mse", "art_mask_threshold": 0.01}
+        )
+        results = []
+        for micro_batch_size in (1, 2, 4, 8):
+            metrics = {}
+            for start in range(0, 8, micro_batch_size):
+                velocity = current[start : start + micro_batch_size]
+                _, step_metrics = compute_art_loss(
+                    velocity,
+                    torch.zeros_like(velocity),
+                    torch.full((micro_batch_size,), 0.5),
+                    torch.full((micro_batch_size,), 0.25),
+                    torch.ones_like(velocity),
+                    magnitude[start : start + micro_batch_size],
+                    config=config,
+                )
+                append_to_dict(metrics, step_metrics)
+            results.append(EmbodiedARTFSDPPolicy._reduce_training_metrics(metrics))
+        assert results[0] == pytest.approx(results[1])
+        assert results[0] == pytest.approx(results[2])
+        assert results[0] == pytest.approx(results[3])
+        assert results[0]["actor/mask_frac"] == (0.0 if all_inactive else 0.5)
+        assert "actor/active_count" not in results[0]
+    finally:
+        dist.destroy_process_group()
+
+
+class _CausalLanguageModel(nn.Module):
+    """Small causal model with sequence boundaries supplied by position IDs."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(32, 8)
+        self.projection = nn.Linear(8, 32)
+
+    def forward(self, input_ids, position_ids, attention_mask=None, **kwargs):
+        from types import SimpleNamespace
+
+        hidden = self.embedding(input_ids)
+        segments = (position_ids == 0).cumsum(dim=-1)
+        allowed = (segments.unsqueeze(2) == segments.unsqueeze(1)) & (
+            position_ids.unsqueeze(2) >= position_ids.unsqueeze(1)
+        )
+        if attention_mask is not None:
+            allowed = allowed & attention_mask.unsqueeze(1)
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            hidden.unsqueeze(1),
+            hidden.unsqueeze(1),
+            hidden.unsqueeze(1),
+            attn_mask=allowed.unsqueeze(1),
+        ).squeeze(1)
+        return SimpleNamespace(logits=self.projection(attended))
+
+
+def _multi_turn_actor(dynamic):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from rlinf.workers.actor.ma_fsdp_actor_worker import MAFSDPActor
+
+    actor = object.__new__(MAFSDPActor)
+    actor.torch_platform = torch.cpu
+    actor.enable_dynamic_batch_size = dynamic
+    actor.max_tokens_per_mbs = 20
+    actor.tokenizer = SimpleNamespace(eos_token_id=0)
+    actor.amp_context = nullcontext()
+    actor.entropy_op_type = "torch"
+    actor.cfg = OmegaConf.create(
+        {
+            "algorithm": {
+                "sampling_params": {"temperature": 0.8},
+                "logprob_forward_micro_batch_size": 3,
+            },
+            "actor": {"model": {"encoder_seq_length": 32}},
+        }
+    )
+    torch.manual_seed(42)
+    actor.model = _CausalLanguageModel()
+    return actor
+
+
+def _multi_turn_batch():
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+
+    lengths = (1, 5, 9, 14)
+    return DynamicRolloutResult(
+        num_sequence=4,
+        group_size=2,
+        idx_to_traj=[0, 0, 1, 1],
+        input_ids=[(torch.arange(n) % 29 + 1).tolist() for n in lengths],
+        prompt_lengths=[1, 3, 4, 5],
+        response_lengths=[0, 2, 5, 9],
+        is_end=[False, False, True, True],
+        rewards=[1.0, 1.0, 0.0, 0.0],
+    ).to_actor_batch()
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_multi_turn_fsdp_forward_matches_individual_sequences_and_gradients(dynamic):
+    import copy
+
+    from rlinf.utils.utils import compute_entropy_from_logits
+
+    actor = _multi_turn_actor(dynamic)
+    batch = _multi_turn_batch()
+    baseline = copy.deepcopy(actor.model)
+    actual_probs, actual_entropy = actor.forward_batch(batch, True)
+    expected_probs, expected_entropy = [], []
+    for row, positions in zip(batch["input_ids"], batch["position_ids"]):
+        logits = baseline(row.unsqueeze(0), positions.unsqueeze(0)).logits / 0.8
+        values = actor.compute_logprobs(logits[:, :-1], row[1:].unsqueeze(0))[0]
+        expected_probs.append(torch.cat((values.new_zeros(1), values)))
+        values = compute_entropy_from_logits(logits[:, :-1])[0]
+        expected_entropy.append(torch.cat((values.new_zeros(1), values)))
+    for actual, expected in zip(
+        actual_probs + actual_entropy, expected_probs + expected_entropy, strict=True
+    ):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    actual_loss = sum(
+        (prob[mask] - 0.03 * entropy[mask]).sum()
+        for prob, entropy, mask in zip(
+            actual_probs, actual_entropy, batch["response_mask"]
+        )
+    )
+    expected_loss = sum(
+        (prob[mask] - 0.03 * entropy[mask]).sum()
+        for prob, entropy, mask in zip(
+            expected_probs, expected_entropy, batch["response_mask"]
+        )
+    )
+    actual_loss.backward()
+    expected_loss.backward()
+    for actual, expected in zip(
+        actor.model.parameters(), baseline.parameters(), strict=True
+    ):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize(
+    ("lengths", "micro_batch_size", "expected_batch_sizes"),
+    [((1, 5, 9, 14), 3, [2, 2]), ((7, 3, 9, 5, 11), 2, [2, 2, 1])],
+)
+def test_multi_turn_fsdp_inference_keeps_order_and_tail(
+    tmp_path, dynamic, lengths, micro_batch_size, expected_batch_sizes
+):
+    actor = _multi_turn_actor(dynamic)
+    actor.cfg.algorithm.logprob_forward_micro_batch_size = micro_batch_size
+    batch = {
+        "input_ids": [torch.arange(n) % 29 + 1 for n in lengths],
+        "position_ids": [torch.arange(n) for n in lengths],
+    }
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        with torch.no_grad():
+            expected = actor.forward_batch(batch)
+            batch_sizes = []
+            hook = actor.model.register_forward_pre_hook(
+                lambda module, args, kwargs: batch_sizes.append(
+                    kwargs["input_ids"].size(0)
+                ),
+                with_kwargs=True,
+            )
+            try:
+                actual, reference = actor.inference_step(batch, False)
+            finally:
+                hook.remove()
+        assert reference is None
+        assert [len(row) for row in actual] == list(lengths)
+        if not dynamic:
+            assert batch_sizes == expected_batch_sizes
+        for row, expected_row in zip(actual, expected, strict=True):
+            assert row.device.type == "cpu" and not row.requires_grad
+            torch.testing.assert_close(row, expected_row)
+    finally:
+        dist.destroy_process_group()
+
+
+def _multi_turn_fsdp_uneven_inference(rank, dynamic, rendezvous):
+    from torch.nn.parallel import DistributedDataParallel
+
+    actor = _multi_turn_actor(dynamic)
+    count = (1, 7)[rank]
+    batch = {
+        "input_ids": [torch.arange(n + 2) % 29 + 1 for n in range(count)],
+        "position_ids": [torch.arange(n + 2) for n in range(count)],
+    }
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        actor.model.register_buffer("inference_calls", torch.zeros(1))
+        actor.model = DistributedDataParallel(actor.model)
+        calls = []
+        actor.model.register_forward_hook(lambda *_: calls.append(1))
+        with torch.no_grad():
+            expected = actor.forward_batch(batch)
+            calls.clear()
+            actual, reference = actor.inference_step(batch, False)
+        assert reference is None
+        assert len(calls) == (2 if dynamic else 3)
+        assert len(batch["input_ids"]) == len(actual) == count
+        for row, expected_row in zip(actual, expected, strict=True):
+            torch.testing.assert_close(row, expected_row)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_multi_turn_fsdp_inference_aligns_uneven_dp_forwards(tmp_path, dynamic):
+    torch.multiprocessing.spawn(
+        _multi_turn_fsdp_uneven_inference,
+        args=(dynamic, str(tmp_path / "rendezvous")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize(
+    "aggregation", ["token-mean", "seq-mean-token-mean", "seq-mean-token-sum"]
+)
+@pytest.mark.parametrize("auxiliary_losses", [False, True])
+def test_multi_turn_fsdp_actor_backward_matches_real_rows(
+    dynamic, aggregation, auxiliary_losses
+):
+    import copy
+
+    from rlinf.algorithms.losses import compute_ppo_actor_loss
+    from rlinf.algorithms.utils import kl_penalty
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+    from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
+    from rlinf.utils.utils import get_loss_agg_func
+
+    actor = _multi_turn_actor(dynamic)
+    actor.task_type = "reasoning"
+    actor.gradient_accumulation = 1
+    actor.calculate_entropy = actor.calculate_entropy_loss = auxiliary_losses
+    actor.kl_beta = 0.1 if auxiliary_losses else 0.0
+    actor.kl_penalty_type = "low_var_kl"
+    actor.loss_agg_func = get_loss_agg_func(aggregation)
+    actor.grad_scaler = torch.amp.GradScaler("cpu", enabled=False)
+    actor._strategy = FSDPStrategy(
+        OmegaConf.create({"fsdp_config": {"enable_gradient_accumulation": False}}), 1
+    )
+    actor.cfg.algorithm.ratio_clip_eps = 0.2
+    actor.cfg.algorithm.loss_type = "actor"
+    actor.cfg.algorithm.entropy_bonus = 0.03 if auxiliary_losses else 0.0
+    batch = _multi_turn_batch()
+    with torch.no_grad():
+        old = actor.forward_batch(batch)
+    batch["recomputed_logprobs"] = old
+    batch["ref_logprobs"] = [row - 0.1 for row in old]
+    batch["advantages"] = [mask.float() for mask in batch["response_mask"]]
+    batch["loss_scales"] = [mask.float() * 0.5 for mask in batch["response_mask"]]
+    baseline_model = copy.deepcopy(actor.model)
+    actor.model = baseline_model
+    probabilities, entropy = actor.forward_batch(batch, True)
+    expected = DynamicRolloutResult.materialize_actor_batch(
+        {
+            **batch,
+            "logprobs": probabilities,
+            "entropy": entropy,
+        },
+        32,
+        0,
+    )
+    real_rows = expected["response_mask"].any(dim=-1)
+    expected = {
+        key: expected[key][real_rows]
+        for key in (
+            "logprobs",
+            "recomputed_logprobs",
+            "ref_logprobs",
+            "advantages",
+            "loss_scales",
+            "entropy",
+            "response_mask",
+        )
+    }
+    mask = expected["response_mask"]
+    loss, _ = compute_ppo_actor_loss(
+        logprobs=expected["logprobs"],
+        old_logprobs=expected["recomputed_logprobs"],
+        advantages=expected["advantages"] * expected["loss_scales"],
+        loss_mask=mask,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        loss_agg_func=actor.loss_agg_func,
+        fast_path_zero_loss_mask=False,
+    )
+    if auxiliary_losses:
+        loss = loss - 0.03 * actor.loss_agg_func(expected["entropy"], mask)
+        loss = loss + 0.1 * actor.loss_agg_func(
+            kl_penalty(expected["logprobs"], expected["ref_logprobs"], "low_var_kl")
+            * expected["loss_scales"],
+            mask,
+        )
+    loss.backward()
+    expected_grads = [
+        parameter.grad.clone() for parameter in baseline_model.parameters()
+    ]
+    assert any(gradient.count_nonzero() for gradient in expected_grads)
+    baseline_model.zero_grad()
+    actual_metrics = actor.forward_backward_batch(0, batch, 1)
+    torch.testing.assert_close(actual_metrics["actor/final_loss"], loss.detach())
+    for parameter, gradient in zip(
+        actor.model.parameters(), expected_grads, strict=True
+    ):
+        torch.testing.assert_close(parameter.grad, gradient)
+    assert all(
+        isinstance(row, torch.Tensor) and row.ndim == 1 for row in batch["input_ids"]
+    )
+
+
+def test_multi_turn_fsdp_dense_splitter_keeps_existing_layout(tmp_path):
+    from rlinf.utils.torch_functionals import batch_pad_to_fixed_len
+    from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
+
+    rows = _multi_turn_batch()
+    dense = {
+        key: batch_pad_to_fixed_len(value, 32, 0)
+        if isinstance(value, list) and key != "idx_to_traj"
+        else value
+        for key, value in rows.items()
+    }
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        row_iter, row_count, row_indices = _multi_turn_actor(
+            True
+        )._split_to_micro_batch(rows, True, max_tokens_per_mbs=20, split_num=2)
+        dense_iter, dense_count, dense_indices = FSDPActor._split_to_micro_batch(
+            dense, True, max_tokens_per_mbs=20, split_num=2
+        )
+        assert row_count == dense_count and row_indices == dense_indices
+        for row_batch, dense_batch in zip(row_iter, dense_iter, strict=True):
+            assert dense_batch["input_ids"].ndim == 2
+            for row, padded in zip(
+                row_batch["input_ids"], dense_batch["input_ids"], strict=True
+            ):
+                torch.testing.assert_close(row, padded[: len(row)])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    ("local", "load_balance"), [(True, False), (False, False), (False, True)]
+)
+def test_multi_turn_fsdp_receive_and_advantages_use_shared_rows(
+    tmp_path, local, load_balance
+):
+    from queue import Queue
+
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+    from rlinf.scheduler import Channel
+    from rlinf.scheduler.channel.channel_worker import LocalChannel
+
+    actor = _multi_turn_actor(False)
+    actor.enable_dp_load_balance = load_balance
+    actor.cfg.data = {"rollout_batch_size": 2}
+    actor.cfg.algorithm.group_size = 2
+    actor.cfg.algorithm.adv_type = "grpo_dynamic"
+    actor.cfg.algorithm.advantage_mode = "trajectory"
+    actor.task_type, actor.reinpp_kl_beta, actor.kl_penalty_type = (
+        "reasoning",
+        0.0,
+        "low_var_kl",
+    )
+    actor._timer_metrics = {}
+    if local:
+        channel = Channel()
+        channel._initialize(
+            "actor-batch", None, None, None, local_channel=LocalChannel()
+        )
+    else:
+        # An in-memory receive endpoint exercises the nonlocal actor boundary.
+        channel = Queue()
+        channel.is_local = False
+    results = []
+    for offset in (0, 3):
+        result = DynamicRolloutResult(
+            num_sequence=2,
+            group_size=2,
+            idx_to_traj=[0, 1],
+            input_ids=[list(range(3 + offset)), list(range(5 + offset))],
+            prompt_lengths=[1, 1],
+            response_lengths=[2 + offset, 4 + offset],
+            rewards=[1.0, 0.0],
+            is_end=[True, True],
+            rollout_logprobs=[[-0.5] * (2 + offset), [-0.25] * (4 + offset)],
+        )
+        results.append(result)
+        channel.put(result)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        batch, received = actor.get_step_batch(channel)
+        assert received == results and channel.empty()
+        if not local:
+            assert batch["extra:source_dp"].tolist() == [0, 0, 0, 0]
+        assert batch["idx_to_traj"] == [0, 1, 2, 3]
+        assert [len(row) for row in batch["input_ids"]] == [3, 5, 6, 8]
+        batch = actor.compute_advantages_and_returns(batch)
+        for row, mask, sign in zip(
+            batch["advantages"], batch["response_mask"], (1, -1, 1, -1), strict=True
+        ):
+            assert row.device.type == "cpu" and row.shape == mask.shape
+            torch.testing.assert_close(row, mask.float() * sign / (2**0.5))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_multi_turn_fsdp_logprob_gap_uses_only_response_tokens(dense):
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+    from rlinf.workers.actor.fsdp_actor_worker import compute_rollout_train_kl
+
+    batch = _multi_turn_batch()
+    batch["rollout_logprobs"] = [
+        torch.full_like(row, -1, dtype=torch.float32) for row in batch["input_ids"]
+    ]
+    batch["recomputed_logprobs"] = [
+        row + 0.1 * (i + 1) for i, row in enumerate(batch["rollout_logprobs"])
+    ]
+    if dense:
+        batch = DynamicRolloutResult.materialize_actor_batch(batch, 32, 0)
+    gap = compute_rollout_train_kl(batch, batch["response_mask"])
+    torch.testing.assert_close(gap, torch.tensor((2 * 0.2 + 5 * 0.3 + 9 * 0.4) / 16))
+
+
+def _prefix_async_uneven_replay(rank, rendezvous):
+    import queue
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rlinf.algorithms.prefix_off_policy.replay import PrefixReplayService
+    from rlinf.algorithms.prefix_off_policy.schedule import PrefixUpdateSchedule
+    from rlinf.data.schema.embodied_types import Trajectory
+    from rlinf.data.storage.replay import TrajectoryReplayBuffer
+    from rlinf.workers.actor.fsdp_prefix_off_policy_worker import (
+        AsyncPrefixOffPolicyFSDPPolicy,
+    )
+
+    cfg = OmegaConf.create({"algorithm": {}, "env": {"train": {}}})
+    worker = object.__new__(AsyncPrefixOffPolicyFSDPPolicy)
+    worker.replay_service = PrefixReplayService(cfg)
+    worker.replay_service.bind_buffers(TrajectoryReplayBuffer(), None)
+    worker.update_schedule = PrefixUpdateSchedule(cfg)
+    worker._recv_queue = queue.Queue()
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=15),
+    )
+    try:
+        with patch.object(
+            Worker, "torch_platform", SimpleNamespace(current_device=lambda: "cpu")
+        ):
+            for source_rank in (0, 1):
+                if rank == source_rank:
+                    worker._recv_queue.put(
+                        Trajectory(
+                            actions=torch.zeros(1, 1, 2),
+                            rewards=torch.ones(1, 1, 1),
+                            forward_inputs={
+                                "actor_switch": torch.ones(1, 1, 1, dtype=torch.bool)
+                            },
+                        )
+                    )
+                worker._drain_received_trajectories()
+                dist.barrier()
+                metrics = worker.replay_service.collect_metrics()
+                assert metrics["replay/actor_switch_rate"] == 1.0
+    finally:
+        dist.destroy_process_group()
+        worker.replay_service.replay_buffer.close()
+
+
+def test_prefix_async_replay_drains_without_rank_collectives(tmp_path):
+    torch.multiprocessing.spawn(
+        _prefix_async_uneven_replay,
+        args=(str(tmp_path / "prefix-replay"),),
+        nprocs=2,
+        join=True,
+    )

@@ -19,6 +19,12 @@ from typing import Any
 
 from ..worker import Worker, WorkerAddress
 from .channel import DEFAULT_KEY
+from .hooks import (
+    ChannelContext,
+    iter_collected,
+    resolve_collector,
+    resolve_dispatcher,
+)
 
 
 @dataclass(order=True)
@@ -117,6 +123,21 @@ class LocalChannel:
         if key not in self._queue_map:
             return True
         return self._queue_map[key].empty()
+
+    def queued_summary(self) -> tuple[int, int]:
+        """Sum queued elements and weights over every key.
+
+        Reading weight off each :class:`WeightedItem` makes this the byte
+        estimate of the queued data when producers put a size as the
+        weight.
+        """
+        items = 0
+        weight = 0
+        for queue in self._queue_map.values():
+            for weighted in queue.peek_all():
+                items += 1
+                weight += weighted.weight
+        return items, weight
 
     def full(self, key: Any = DEFAULT_KEY) -> bool:
         """Check if the channel queue is full.
@@ -226,6 +247,26 @@ class LocalChannel:
         self.create_queue(key, maxsize=self.maxsize())
         return self._queue_map[key].peek_all()
 
+    def remove_key(self, key: Any = DEFAULT_KEY) -> int:
+        """Drop every queued item for ``key`` and remove the queue itself.
+
+        The default key cannot be removed: every other queue inherits its
+        maxsize. The next put on ``key`` re-creates the queue.
+
+        Args:
+            key (Any): The key whose items are dropped.
+
+        Returns:
+            int: The number of items that were dropped.
+
+        """
+        if key == DEFAULT_KEY:
+            raise ValueError(
+                f"Expected a key other than the default queue, got {key!r}"
+            )
+        queue = self._queue_map.pop(key, None)
+        return queue.qsize() if queue is not None else 0
+
 
 class ChannelWorker(Worker):
     """The actual worker that holds the channel."""
@@ -233,11 +274,22 @@ class ChannelWorker(Worker):
     MEM_CLEAN_THRESHOLD = 0.4
     MEM_CLEAN_PERIOD_SECONDS = 5
 
-    def __init__(self, maxsize: int = 0):
+    def __init__(
+        self,
+        maxsize: int = 0,
+        collector: Any = None,
+        dispatcher: Any = None,
+        context: ChannelContext | None = None,
+    ):
         """Initialize the ChannelWorker with a maximum size for the queue.
 
         Args:
             maxsize (int): The maximum size of the default channel queue. Defaults to 0 (unbounded).
+            collector (Any): Collector spec transforming items on the way in. See
+                :func:`~rlinf.scheduler.channel.hooks.resolve_collector`. Defaults to pass-through.
+            dispatcher (Any): Dispatcher spec choosing each item's consumer. See
+                :func:`~rlinf.scheduler.channel.hooks.resolve_dispatcher`. Defaults to one shared queue per key.
+            context (ChannelContext): Description of the channel handed to both hooks' ``setup``.
 
         """
         super().__init__()
@@ -245,7 +297,73 @@ class ChannelWorker(Worker):
         self._queue_map[DEFAULT_KEY] = PeekQueue(maxsize=maxsize)
         self._key_to_channel_rank: dict[Any, int] = {}
 
+        self._context = context or ChannelContext(name=self.worker_address.get_name())
+        self._collector = resolve_collector(collector)
+        self._dispatcher = resolve_dispatcher(dispatcher)
+        self._collector.setup(self._context)
+        self._dispatcher.setup(self._context)
+        # Private per-consumer queues, only used when the dispatcher deals.
+        self._deals = self._dispatcher.deals
+        self._consumer_queues: dict[str, dict[str, PeekQueue]] = {}
+
         self._mem_cleaner_task = asyncio.create_task(self._mem_cleaner())
+
+    def _consumer_queue(self, key: Any, consumer: str) -> PeekQueue:
+        """Return the private queue holding ``key`` items dealt to ``consumer``."""
+        queues = self._consumer_queues.setdefault(key, {})
+        queue = queues.get(consumer)
+        if queue is None:
+            queue = PeekQueue(maxsize=self.maxsize(key))
+            queues[consumer] = queue
+        return queue
+
+    def _queue_for_get(self, key: Any, consumer: str) -> PeekQueue:
+        """Return the queue a consumer should read ``key`` from."""
+        if not self._deals:
+            self.create_queue(key, self.maxsize())
+            return self._queue_map[key]
+        observe = getattr(self._dispatcher, "observe", None)
+        if observe is not None:
+            observe(consumer)
+        return self._consumer_queue(key, consumer)
+
+    async def _enqueue(self, key: Any, item: Any, weight: int, nowait: bool = False):
+        """Route one collected item to its queue."""
+        consumer = self._dispatcher.route(item, key) if self._deals else None
+        weighted_item = WeightedItem(weight=weight, item=item)
+        if consumer is None:
+            self.create_queue(key, self.maxsize())
+            queue = self._queue_map[key]
+        else:
+            queue = self._consumer_queue(key, consumer)
+        if nowait:
+            queue.put_nowait(weighted_item)
+        else:
+            await queue.put(weighted_item)
+
+    def _unrouted_queue(self, key: Any) -> PeekQueue | None:
+        """Return the shared queue populated before consumer discovery."""
+        queue = self._queue_map.get(key)
+        return queue if queue is not None and not queue.empty() else None
+
+    async def _take(self, key: Any, consumer: str, nowait: bool) -> WeightedItem:
+        """Take one item for ``consumer``, stealing from a peer if allowed."""
+        queue = self._queue_for_get(key, consumer)
+        if self._deals and queue.empty():
+            unrouted = self._unrouted_queue(key)
+            if unrouted is not None:
+                return unrouted.get_nowait()
+        if nowait:
+            return queue.get_nowait()
+        if self._deals and queue.empty():
+            depths = {
+                name: peer.qsize()
+                for name, peer in self._consumer_queues.get(key, {}).items()
+            }
+            donor = self._dispatcher.rebalance(key, consumer, depths)
+            if donor is not None and donor in self._consumer_queues.get(key, {}):
+                return self._consumer_queues[key][donor].get_nowait()
+        return await queue.get()
 
     async def _mem_cleaner(self):
         """A background task that cleans up memory when triggered."""
@@ -308,16 +426,21 @@ class ChannelWorker(Worker):
             return
         self._queue_map[key] = PeekQueue(maxsize=maxsize)
 
-    def qsize(self, key: Any = DEFAULT_KEY) -> int:
+    def qsize(self, key: Any = DEFAULT_KEY, consumer: str | None = None) -> int:
         """Get the size of the channel queue.
 
         Args:
             key (Any): The key to check the queue size for.
+            consumer (str): Report only this consumer's share when the dispatcher
+                deals. Defaults to the total outstanding across all consumers.
 
         """
-        if key not in self._queue_map:
-            return 0
-        return self._queue_map[key].qsize()
+        if consumer is not None:
+            return self._consumer_queues.get(key, {}).get(consumer, PeekQueue()).qsize()
+        total = self._queue_map[key].qsize() if key in self._queue_map else 0
+        for queue in self._consumer_queues.get(key, {}).values():
+            total += queue.qsize()
+        return total
 
     def empty(self, key: Any = DEFAULT_KEY) -> bool:
         """Check if the channel queue is empty.
@@ -326,9 +449,28 @@ class ChannelWorker(Worker):
             key (Any): The key to check the queue emptiness for.
 
         """
-        if key not in self._queue_map:
-            return True
-        return self._queue_map[key].empty()
+        return self.qsize(key) == 0
+
+    def queued_summary(self) -> tuple[int, int]:
+        """Sum queued elements and weights over every key.
+
+        Covers both the shared queues and the per-consumer queues a dealing
+        dispatcher fills. Reading weight off each :class:`WeightedItem`
+        makes this the byte estimate of the queued data when producers put
+        a size as the weight.
+        """
+        items = 0
+        weight = 0
+        for queue in self._queue_map.values():
+            for weighted in queue.peek_all():
+                items += 1
+                weight += weighted.weight
+        for queues in self._consumer_queues.values():
+            for queue in queues.values():
+                for weighted in queue.peek_all():
+                    items += 1
+                    weight += weighted.weight
+        return items, weight
 
     def full(self, key: Any = DEFAULT_KEY) -> bool:
         """Check if the channel queue is full.
@@ -366,12 +508,8 @@ class ChannelWorker(Worker):
 
         """
         item, (key, weight) = self.recv(src_addr.root_group_name, src_addr.rank_path)
-        self.create_queue(key, self.maxsize())
-        item = WeightedItem(weight=weight, item=item)
-        if nowait:
-            self._queue_map[key].put_nowait(item)
-        else:
-            await self._queue_map[key].put(item)
+        for out_key, out_item in iter_collected(self._collector, item, key):
+            await self._enqueue(out_key, out_item, weight, nowait=nowait)
 
     async def put_via_ray(
         self,
@@ -390,12 +528,8 @@ class ChannelWorker(Worker):
             nowait (bool): If True, directly raise asyncio.QueueFull if the queue is full. Defaults to False.
 
         """
-        self.create_queue(key, self.maxsize())
-        weighted_item = WeightedItem(weight=weight, item=item)
-        if nowait:
-            self._queue_map[key].put_nowait(weighted_item)
-        else:
-            await self._queue_map[key].put(weighted_item)
+        for out_key, out_item in iter_collected(self._collector, item, key):
+            await self._enqueue(out_key, out_item, weight, nowait=nowait)
 
     async def get(
         self,
@@ -414,15 +548,15 @@ class ChannelWorker(Worker):
             nowait (bool): If True, directly raise asyncio.QueueEmpty if the queue is empty. Defaults to False.
 
         """
-        self.create_queue(key, self.maxsize())
+        consumer = dst_addr.get_name()
         if nowait:
             try:
-                weighted_item: WeightedItem = self._queue_map[key].get_nowait()
+                weighted_item: WeightedItem = await self._take(key, consumer, True)
             except asyncio.QueueEmpty:
                 query_id = asyncio.QueueEmpty
                 weighted_item = WeightedItem(weight=0, item=None)
         else:
-            weighted_item: WeightedItem = await self._queue_map[key].get()
+            weighted_item: WeightedItem = await self._take(key, consumer, False)
         self.send(
             weighted_item.item,
             dst_addr.root_group_name,
@@ -464,15 +598,15 @@ class ChannelWorker(Worker):
             When a key is given, the channel will look for the item in the queue associated with that key.
 
         """
-        self.create_queue(key, self.maxsize())
+        queue = self._queue_for_get(key, dst_addr.get_name())
         batch = []
         current_weight = 0
         while True:
-            next_item: WeightedItem = await self._queue_map[key].peek()
+            next_item: WeightedItem = await queue.peek()
             if next_item is None or current_weight + next_item.weight > target_weight:
                 break
             current_weight += next_item.weight
-            item = await self._queue_map[key].get()
+            item = await queue.get()
             batch.append(item.item)
             if current_weight >= target_weight:
                 break
@@ -523,6 +657,32 @@ class ChannelWorker(Worker):
         """
         self.create_queue(key, self.maxsize())
         return self._queue_map[key].peek_all()
+
+    def remove_key(self, key: Any = DEFAULT_KEY) -> int:
+        """Drop every queued item for ``key`` and delete the key's queues.
+
+        Unlike a get, the dropped items never leave the worker, so large
+        payloads are not pulled to the caller's node. A consumer blocked
+        getting from ``key`` is not woken, so only remove keys no consumer
+        will read. The default key cannot be removed: every other queue
+        inherits its maxsize. The next put on ``key`` re-creates the queue.
+
+        Args:
+            key (Any): The key whose items and queues are dropped.
+
+        Returns:
+            int: The number of items that were dropped, across the shared
+            queue and all per-consumer queues.
+
+        """
+        if key == DEFAULT_KEY:
+            raise ValueError(
+                f"Expected a key other than the default queue, got {key!r}"
+            )
+        dropped = self.qsize(key)
+        self._queue_map.pop(key, None)
+        self._consumer_queues.pop(key, None)
+        return dropped
 
     async def ensure_key_replica(self, key: Any, src_node_rank: int = -1) -> int:
         """Assign (or fetch) the replica rank that should host the given key.

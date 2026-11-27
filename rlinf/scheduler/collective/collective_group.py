@@ -19,6 +19,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, is_dataclass, replace
+from functools import partial
 from pickle import Pickler, Unpickler
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -29,9 +30,8 @@ from ray.cloudpickle import Pickler as CloudPickler
 from torch.multiprocessing.reductions import reduce_tensor
 
 from ..cluster.utils import (
-    DataclassTensorFieldsMetadata,
-    extract_dataclass_tensor_fields,
-    unflatten_dataclass_tensor_fields,
+    pack_dataclass_tensors,
+    unpack_dataclass_tensors,
 )
 from ..manager import (
     CollectiveGroupInfo,
@@ -40,7 +40,7 @@ from ..manager import (
     WorkerInfo,
 )
 from ..worker import Worker, WorkerAddress
-from .async_work import AsyncFuncWork, AsyncWork
+from .async_work import AsyncFuncWork, AsyncWork, PeerCommunicationError
 from .tensor_buffer_pool import BufferLease
 from .tensor_compression import TensorCompressionWireMetadata
 
@@ -50,10 +50,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class TensorData:
-    """Metadata for tensor containers (list, dict, or dataclass with tensor fields).
+    """Metadata for tensor containers and dataclasses with nested tensors.
 
     Used by TENSOR_LIST, TENSOR_DICT, and DATACLASS_WITH_TENSORS object types
-    to pass precomputed device info and optional dataclass-specific fields.
+    to pass precomputed device info and an optional dataclass skeleton.
     """
 
     cpu_tensor_mask: list[bool]
@@ -69,9 +69,8 @@ class TensorData:
     """Compression metadata for the prepared CPU wire tensors."""
 
     # For dataclass
-    tensor_fields: Optional[dict[str, Any]] = None
-    metadata: Optional[DataclassTensorFieldsMetadata] = None
     tensors_list: Optional[list[torch.Tensor]] = None
+    skeleton: Optional[Any] = None
 
     @property
     def has_cpu_tensor(self) -> bool:
@@ -284,6 +283,77 @@ class CollectiveGroup:
             for _ in range(CollectiveGroup.POOL_SIZE)
         ]
 
+        # The first exception of each direction, shared by every pool queue of
+        # that direction: a send or recv that failed lost its place in the
+        # stream, so later operations of that direction cannot run.
+        self._direction_failures: dict[str, Optional[Exception]] = {
+            "send": None,
+            "recv": None,
+        }
+
+    def _run_guarded(
+        self,
+        direction: str,
+        func: Any,
+        work: AsyncFuncWork,
+        **kwargs,
+    ) -> Optional[AsyncFuncWork]:
+        """Run a direction's function, unless that direction already failed.
+
+        The queue thread calls this through the work, and the synchronous path
+        calls the work in the caller's thread, so both are refused here. A
+        refused work never starts, and the first failure is chained to the
+        error it raises.
+        """
+        failure = self._direction_failures[direction]
+        if failure is not None:
+            raise PeerCommunicationError(
+                f"an earlier {direction} in collective group {self._group_name} "
+                f"failed ({failure!r}); later {direction}s in this group are "
+                f"not run"
+            ) from failure
+        return func(work, **kwargs)
+
+    def _watch_work(
+        self, work: AsyncFuncWork, direction: Optional[str], comm_id: int
+    ) -> None:
+        """Log this work's failure, and record it as its direction's failure.
+
+        Registered with add_done_callback, so it runs when the work completes
+        however it completes: on the queue thread for an async operation, in
+        the caller's thread for a synchronous one. It reads the work's final
+        outcome, so a work whose function returned another work reports the
+        chain's failure. ``direction`` is None for broadcast work, which is
+        logged but does not fail its group.
+        """
+
+        def _record(future) -> None:
+            try:
+                future.wait()
+            except Exception as exc:
+                if direction is None:
+                    self._logger.error(
+                        f"collective broadcast {comm_id} failed in group "
+                        f"{self._group_name}: {exc!r}"
+                    )
+                    return
+                if isinstance(exc, PeerCommunicationError):
+                    # This work was refused because the direction had already
+                    # failed, and that first failure was logged already.
+                    self._logger.debug(
+                        f"collective {direction} {comm_id} not run in group "
+                        f"{self._group_name}: {exc!r}"
+                    )
+                    return
+                self._logger.error(
+                    f"collective {direction} {comm_id} failed in group "
+                    f"{self._group_name}: {exc!r}"
+                )
+                if self._direction_failures[direction] is None:
+                    self._direction_failures[direction] = exc
+
+        work.add_done_callback(_record)
+
     def _get_global_accelerator_id(self, device: torch.device | int) -> str:
         """Return the worker placement's global accelerator id for UUID-less platforms."""
         if isinstance(device, torch.device):
@@ -328,7 +398,7 @@ class CollectiveGroup:
 
         # Create AsyncFuncWork for the send operation
         send_work = AsyncFuncWork(
-            self._atomic_send,
+            partial(self._run_guarded, "send", self._atomic_send),
             object=object,
             comm_id=send_comm_id,
             object_type=object_type,
@@ -337,6 +407,7 @@ class CollectiveGroup:
             piggyback_payload=piggyback_payload,
             pass_self=True,
         )
+        self._watch_work(send_work, "send", send_comm_id)
 
         # Capture CUDA event of the main stream if sending accelerator tensors
         if tensor_data.has_accel_tensor:
@@ -466,12 +537,13 @@ class CollectiveGroup:
             current_device = None
 
         recv_work = AsyncFuncWork(
-            self._atomic_recv,
+            partial(self._run_guarded, "recv", self._atomic_recv),
             comm_id=recv_comm_id,
             current_device=current_device,
             options=options,
             pass_self=True,
         )
+        self._watch_work(recv_work, "recv", recv_comm_id)
 
         if self._worker.has_accelerator and Worker.torch_platform.is_initialized():
             recv_event = Worker.torch_platform.Event()
@@ -552,7 +624,7 @@ class CollectiveGroup:
         object_type, tensor_data = self._get_object_info(tensor)
 
         send_work = AsyncFuncWork(
-            self._atomic_send_tensor,
+            partial(self._run_guarded, "send", self._atomic_send_tensor),
             tensor=tensor,
             comm_id=send_comm_id,
             object_type=object_type,
@@ -560,6 +632,7 @@ class CollectiveGroup:
             options=options,
             pass_self=True,
         )
+        self._watch_work(send_work, "send", send_comm_id)
 
         if tensor_data.has_accel_tensor:
             send_event = Worker.torch_platform.Event()
@@ -631,12 +704,13 @@ class CollectiveGroup:
         recv_comm_id = next(self._recv_comm_id_iter)
 
         recv_work = AsyncFuncWork(
-            self._atomic_recv_tensor,
+            partial(self._run_guarded, "recv", self._atomic_recv_tensor),
             tensor=tensor,
             comm_id=recv_comm_id,
             options=options,
             pass_self=True,
         )
+        self._watch_work(recv_work, "recv", recv_comm_id)
 
         if self._worker.has_accelerator and Worker.torch_platform.is_initialized():
             recv_event = Worker.torch_platform.Event()
@@ -687,6 +761,7 @@ class CollectiveGroup:
             options=options,
             pass_self=True,
         )
+        self._watch_work(broadcast_work, None, broadcast_comm_id)
 
         if self._worker.has_accelerator and Worker.torch_platform.is_initialized():
             broadcast_event = Worker.torch_platform.Event()
@@ -1522,10 +1597,8 @@ class CollectiveGroup:
             )
 
         elif is_dataclass(object):
-            tensor_fields, tensors_list, metadata = extract_dataclass_tensor_fields(
-                object
-            )
-            if tensor_fields:
+            skeleton, tensors_list = pack_dataclass_tensors(object)
+            if tensors_list:
                 (
                     cpu_tensor_mask,
                     cpu_tensors,
@@ -1537,9 +1610,8 @@ class CollectiveGroup:
                     cpu_tensor_mask=cpu_tensor_mask,
                     cpu_tensors=cpu_tensors,
                     accel_tensors=accel_tensors,
-                    tensor_fields=tensor_fields,
-                    metadata=metadata,
                     tensors_list=tensors_list,
+                    skeleton=skeleton,
                 )
 
         return object_type, tensor_data
@@ -2573,12 +2645,12 @@ class CollectiveGroup:
         piggyback_payload: Optional[Any] = None,
         work: Optional[AsyncFuncWork] = None,
     ):
-        """Send a dataclass with tensor fields (tensor, list of tensors, or dict of tensors) to the destination.
+        """Send a dataclass skeleton and its recursively nested tensors.
 
         Args:
             tensor_dataclass (Any): The dataclass with tensor fields to send.
             comm_id (int): The ID for the send operation.
-            tensor_data (TensorData): Pre-computed metadata from `_get_object_device_type` (must have tensor_fields, metadata, tensors_list set).
+            tensor_data (TensorData): Precomputed tensor placement and skeleton.
             async_op (bool): Whether to perform the operation asynchronously.
             piggyback_payload (Optional[Any]): Payload to piggyback with the skeleton.
             work (Optional[AsyncFuncWork]): If provided, payload-transfer time is
@@ -2587,27 +2659,20 @@ class CollectiveGroup:
         Returns:
             Optional[AsyncWork]: If async_op is True, returns an AsyncWork; otherwise None.
         """
-        assert tensor_data.tensor_fields is not None
-        assert tensor_data.metadata is not None
         assert tensor_data.tensors_list is not None
-        metadata = tensor_data.metadata
+        assert tensor_data.skeleton is not None
         flat_tensors = tensor_data.tensors_list
-        tensor_fields = tensor_data.tensor_fields
 
-        # Send flat tensor list with metadata as piggyback, then skeleton + piggyback.
+        # Send tensors independently from the lightweight nested skeleton.
         self._send_tensor_list(
             flat_tensors,
             comm_id,
             tensor_data=tensor_data,
             async_op=async_op,
-            piggyback_payload=metadata,
             work=work,
         )
-        tensor_field_names = set(tensor_fields.keys())
-        overwrite_kwargs = dict.fromkeys(tensor_field_names, None)
-        skeleton = replace(tensor_dataclass, **overwrite_kwargs)
         return self._send_object(
-            skeleton,
+            tensor_data.skeleton,
             comm_id=comm_id,
             async_op=async_op,
             piggyback_payload=piggyback_payload,
@@ -2619,16 +2684,15 @@ class CollectiveGroup:
         comm_id: int,
         work: Optional[AsyncFuncWork] = None,
     ) -> tuple[Any, Any]:
-        r"""Receive a dataclass with tensor fields (tensor, list, or dict of tensors).
+        r"""Receive a dataclass skeleton and its recursively nested tensors.
 
         Mirrors `_send_tensor_dataclass`:
-        1) Receive flat tensor list (metadata comes as piggyback_payload).
-        2) Receive skeleton dataclass and reconstruct by refilling tensor fields.
+        1) Receive the flat tensor list.
+        2) Receive the skeleton and restore its tensor placeholders.
         """
-        flat_tensors, metadata = self._recv_tensor_list(comm_id, work=work)
-        tensor_dict = unflatten_dataclass_tensor_fields(metadata, flat_tensors)
+        flat_tensors, _ = self._recv_tensor_list(comm_id, work=work)
         skeleton, pb_data = self._recv_object(comm_id, work=work)
-        dataclass_obj = replace(skeleton, **tensor_dict)
+        dataclass_obj = unpack_dataclass_tensors(skeleton, flat_tensors)
         return dataclass_obj, pb_data
 
     def _broadcast_tensor_dataclass(
@@ -2647,20 +2711,11 @@ class CollectiveGroup:
             - `tensor_dataclass` must be None.
         """
         if self._rank == src_rank:
-            tensor_dict, flat_tensors, metadata = extract_dataclass_tensor_fields(
-                tensor_dataclass
-            )
-            tensor_field_names = set(tensor_dict.keys())
-            overwrite_kwargs = dict.fromkeys(tensor_field_names, None)
-            skeleton = replace(tensor_dataclass, **overwrite_kwargs)
+            skeleton, flat_tensors = pack_dataclass_tensors(tensor_dataclass)
         else:
-            metadata = None
             flat_tensors = None
             skeleton = None
 
-        recv_metadata = self._broadcast_object(
-            metadata, comm_id=comm_id, src_rank=src_rank
-        )
         recv_flat_tensors = self._broadcast_tensor_list(
             flat_tensors,
             comm_id=comm_id,
@@ -2668,13 +2723,10 @@ class CollectiveGroup:
             options=options,
             work=work,
         )
-        recv_tensor_dict = unflatten_dataclass_tensor_fields(
-            recv_metadata, recv_flat_tensors
-        )
         recv_skeleton = self._broadcast_object(
             skeleton, comm_id=comm_id, src_rank=src_rank, work=work
         )
-        return replace(recv_skeleton, **recv_tensor_dict)
+        return unpack_dataclass_tensors(recv_skeleton, recv_flat_tensors)
 
     def _send_object(
         self,

@@ -69,7 +69,7 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  backend: "huggingface"
+  rollout_backend: "huggingface"
   recompute_logprobs: False
   enable_offload: True
   pipeline_stage_num: 1
@@ -80,6 +80,7 @@ rollout:
     add_value_head: True
     num_steps: 5
     openpi:
+      task: eval
       config_name: "pi05_aloha_robotwin"
       num_images_in_input: 3
       noise_level: 0.3

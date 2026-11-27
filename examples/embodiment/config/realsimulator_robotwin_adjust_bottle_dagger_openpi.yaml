@@ -144,14 +144,14 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  backend: "huggingface"
+  rollout_backend: "huggingface"
   recompute_logprobs: False
   enable_offload: False
   pipeline_stage_num: 1
   collect_prev_infos: False
 
   model:
-    model_path: "/path/to/model"
+    model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
 
   expert_model:
@@ -173,6 +173,7 @@ actor:
     add_value_head: False
     action_dim: 14
     openpi:
+      task: dagger
       config_name: "pi0_aloha_robotwin"
       num_images_in_input: 3
       train_expert_only: False
@@ -197,7 +198,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    use_orig_params: False
+    use_orig_params: True
     gradient_checkpointing: False
     mixed_precision:
       param_dtype: ${actor.model.precision}

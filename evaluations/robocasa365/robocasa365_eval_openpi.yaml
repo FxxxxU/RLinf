@@ -67,7 +67,7 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  generation_backend: "huggingface"
+  rollout_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: robocasa
   enable_offload: False
@@ -94,6 +94,7 @@ rollout:
     num_steps: 5
     add_value_head: False
     openpi:
+      task: eval
       config_name: "pi0_robocasa365_pretrain_human300"
       num_images_in_input: 2
       noise_level: 0.5

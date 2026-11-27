@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
+import functools
 import json
 import os
 from typing import Optional, Union
@@ -23,10 +25,72 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 from PIL import Image
 
-from rlinf.envs.sim.robotwin.seed_utils import partition_success_seeds
-from rlinf.envs.utils import center_crop_image, list_of_dict_to_dict_of_list
+from rlinf.envs.utils import (
+    center_crop_image,
+    list_of_dict_to_dict_of_list,
+    partition_success_seeds,
+    valid_action_mask_from_counts,
+)
 
 __all__ = ["RoboTwinEnv"]
+
+# RoboTwin creates its cameras with a 0.1 m near plane. SAPIEN 3.0.1 clips
+# everything closer, which hides the gripper fingers from the wrist cameras the
+# released checkpoints were trained with.
+DEFAULT_CAMERA_NEAR = 0.01
+# Task argument that carries the near plane to RoboTwin's Camera.
+CAMERA_NEAR_ARG = "camera_near"
+
+
+class _NearPlaneScene:
+    """Forward a SAPIEN scene, creating every camera with a fixed near plane."""
+
+    def __init__(self, scene, near: float) -> None:
+        self._scene = scene
+        self._near = near
+
+    def add_camera(self, *args, **kwargs):
+        kwargs["near"] = self._near
+        return self._scene.add_camera(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._scene, name)
+
+
+def install_camera_near_plane(camera_cls: type) -> None:
+    """Let each RoboTwin task choose the near plane of its cameras.
+
+    RoboTwin builds a new ``Camera`` from the task arguments every time it sets
+    up a task, which happens on every reset. After this call, a ``camera_near``
+    task argument sets the near plane of every camera that ``Camera`` creates;
+    ``None`` or no argument keeps RoboTwin's own value. The value travels with
+    each task, so tasks in one process can use different values. The class is
+    changed in memory, so the RoboTwin checkout stays untouched, and installing
+    the hook again has no further effect.
+
+    Args:
+        camera_cls: RoboTwin's ``envs.camera.Camera`` class.
+    """
+    if getattr(camera_cls, "_rlinf_camera_near_installed", False):
+        return
+    init = camera_cls.__init__
+    load_camera = camera_cls.load_camera
+
+    @functools.wraps(init)
+    def init_with_near(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self._rlinf_camera_near = kwargs.get(CAMERA_NEAR_ARG)
+
+    @functools.wraps(load_camera)
+    def load_camera_with_near(self, scene, *args, **kwargs):
+        near = getattr(self, "_rlinf_camera_near", None)
+        if near is not None:
+            scene = _NearPlaneScene(scene, near)
+        return load_camera(self, scene, *args, **kwargs)
+
+    camera_cls.__init__ = init_with_near
+    camera_cls.load_camera = load_camera_with_near
+    camera_cls._rlinf_camera_near_installed = True
 
 
 class RoboTwinEnv(gym.Env):
@@ -59,7 +123,11 @@ class RoboTwinEnv(gym.Env):
 
         self.cfg = cfg
         self.record_metrics = record_metrics
+        self.skip_intermediate_renders = bool(
+            cfg.get("skip_intermediate_renders", True)
+        )
         self._is_start = True
+        self._reset_count = 0
 
         self.task_name = cfg.task_config.task_name
 
@@ -81,12 +149,18 @@ class RoboTwinEnv(gym.Env):
         mp.set_start_method("spawn", force=True)
         os.environ["ASSETS_PATH"] = self.cfg.assets_path
 
+        from envs.camera import Camera
         from robotwin.envs.vector_env import VectorEnv
+
+        install_camera_near_plane(Camera)
+        # RoboTwin hands the task arguments to every Camera it builds.
+        task_config = OmegaConf.to_container(self.cfg.task_config, resolve=True)
+        task_config[CAMERA_NEAR_ARG] = self.cfg.get("camera_near", DEFAULT_CAMERA_NEAR)
 
         env_seeds = self.reset_state_ids.tolist()
 
         self.venv = VectorEnv(
-            task_config=OmegaConf.to_container(self.cfg.task_config, resolve=True),
+            task_config=task_config,
             n_envs=self.num_envs,
             env_seeds=env_seeds,
         )
@@ -256,6 +330,11 @@ class RoboTwinEnv(gym.Env):
 
         extracted_obs = self._extract_obs_image(raw_obs)
 
+        self._reset_count += 1
+        trim_interval = self.cfg.get("malloc_trim_reset_interval", 0)
+        if trim_interval > 0 and self._reset_count % trim_interval == 0:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+
         return extracted_obs, infos
 
     def step(
@@ -329,13 +408,26 @@ class RoboTwinEnv(gym.Env):
         obs_list = []
         infos_list = []
 
-        raw_obs, step_reward, terminations, truncations, info_list = self.venv.step(
-            chunk_actions
-        )
-        extracted_obs = self._extract_obs_image(raw_obs)
+        if not self.skip_intermediate_renders:
+            raw_obs_list, step_reward, terminations, truncations, info_list = (
+                self.venv.step_with_full_obs(chunk_actions)
+            )
+            obs_list = [self._extract_obs_image(raw_obs) for raw_obs in raw_obs_list]
+            infos_list = [{} for _ in range(chunk_step)]
+        else:
+            raw_obs, step_reward, terminations, truncations, info_list = self.venv.step(
+                chunk_actions
+            )
+            obs_list.append(self._extract_obs_image(raw_obs))
+            infos_list.append({})
+
         infos = list_of_dict_to_dict_of_list(info_list)
-        obs_list.append(extracted_obs)
-        infos_list.append(infos)
+        infos_list[-1] = infos
+        # RoboTwin pads the observation list to the chunk length and reports
+        # how many actions were actually executed.
+        executed_action_count = None
+        if isinstance(infos, dict):
+            executed_action_count = infos.pop("executed_action_count", None)
         if isinstance(terminations, list):
             terminations = torch.as_tensor(
                 np.array(terminations).reshape(-1), device=self.device
@@ -382,6 +474,11 @@ class RoboTwinEnv(gym.Env):
 
         chunk_truncations = torch.zeros((num_envs, chunk_step), dtype=bool)
         chunk_truncations[:, -1] = truncations
+
+        if executed_action_count is not None and not self.cfg.get("is_eval", False):
+            infos_list[-1]["valid_action_mask"] = valid_action_mask_from_counts(
+                executed_action_count, chunk_step
+            )
 
         return (
             obs_list,
